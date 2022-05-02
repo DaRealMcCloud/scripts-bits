@@ -1,30 +1,29 @@
 # importing the required module
+import matplotlib as mpl
 import matplotlib.pyplot as plt
+import numpy as np
+from datetime import datetime
+
+#https://home.openweathermap.org/users/sign_up
+
 csvFileName='pegelPruem.csv'
 
 with open(csvFileName) as f:
     lineList=f.read().splitlines()
 
-# x axis values
+fig, ax = plt.subplots()  # Create a figure containing a single axes
+
+# x and y axis values
 x = []
-# corresponding y axis values
 y = []
-
 for line in lineList:
-    x.append(line.split(",")[0]+":"+line.split(",")[1])
-    y.append(line.split(",")[2])
+    x.append(datetime.strptime(line.split(",")[0]+":"+line.split(",")[1], "%d.%m.%Y:%H:%M") )
+    y.append(int(line.split(",")[2]))
 
- 
-# plotting the points
-plt.plot(x, y)
- 
-# naming the x axis
-plt.xlabel('cm')
-# naming the y axis
-plt.ylabel('date')
- 
-# giving a title to my graph
+plt.xlabel('date')
+plt.ylabel('cm')
 plt.title('Pegel Prüm!')
- 
-# function to show the plot
+plt.plot(x, y)
 plt.show()
+
+quit()
