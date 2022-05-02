@@ -1,35 +1,8 @@
-#import requests
-#fname = 'pegel.txt'
-#url = 'https://www.hochwasser-rlp.de/karte/einzelpegel/flussgebiet/mosel/pegel/PRUEM_2/darstellung/tabellarisch'
-#r = requests.get(url)
-#open(fname , 'wb').write(r.content)
-
-class Prepender:
-
-    def __init__(self, fname, mode='w'):
-        self.__write_queue = []
-        self.__f = open(fname, mode)
-
-    def write(self, s):
-        self.__write_queue.insert(0, s)
-
-    def close(self):
-        self.__exit__(None, None, None)
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, type, value, traceback):
-        if self.__write_queue: 
-            self.__f.writelines(self.__write_queue)
-        self.__f.close()
-
-
-
 import requests
 from bs4 import BeautifulSoup
 import os.path
 import time
+from GetWeatherString import GetWeatherString
 
 csvFileName='pegelPruem.csv'
 url = 'https://www.hochwasser-rlp.de/karte/einzelpegel/flussgebiet/mosel/pegel/PRUEM_2/darstellung/tabellarisch'
@@ -95,4 +68,6 @@ while True:
             for dataPoint in dataList:
                 f.write(dataPoint+"\n")
 
+    weatherString=GetWeatherString("Prüm","DE")
+    
     time.sleep(900)
