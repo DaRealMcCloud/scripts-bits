@@ -1,3 +1,4 @@
+from datetime import datetime
 import requests
 from bs4 import BeautifulSoup
 import os.path
@@ -70,7 +71,8 @@ while True:
                 f.write(dataPoint+"\n")
 
     weatherString=GetWeatherString("Prüm","DE")
+    today=datetime.datetime.now()
     with open(csvFileWeather,'a') as f:
-        f.write(weatherString+"\n")
+        f.write(today.strftime("%d.%m.%Y:%H:%M")+weatherString+"\n")
     
     time.sleep(900)
