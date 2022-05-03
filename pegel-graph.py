@@ -6,6 +6,8 @@ from datetime import datetime
 
 #https://home.openweathermap.org/users/sign_up
 
+
+
 csvFileName='pegelPruem.csv'
 
 with open(csvFileName) as f:
