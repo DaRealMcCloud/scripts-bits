@@ -5,6 +5,7 @@ import time
 from GetWeatherString import GetWeatherString
 
 csvFileName='pegelPruem.csv'
+csvFileWeather="weatherPruem.csv"
 url = 'https://www.hochwasser-rlp.de/karte/einzelpegel/flussgebiet/mosel/pegel/PRUEM_2/darstellung/tabellarisch'
 
 while True:
@@ -69,5 +70,7 @@ while True:
                 f.write(dataPoint+"\n")
 
     weatherString=GetWeatherString("Prüm","DE")
+    with open(csvFileWeather,'a') as f:
+        f.write(weatherString+"\n")
     
     time.sleep(900)
