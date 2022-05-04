@@ -72,7 +72,7 @@ while True:
                 f.write(dataPoint+"\n")
 
     weatherString=GetWeatherString("Prüm","DE")
-    today=datetime.datetime.now()
+    today=datetime.now()
     with open(csvFileWeather,'a') as f:
         f.write(today.strftime("%d.%m.%Y:%H:%M")+weatherString+"\n")
     

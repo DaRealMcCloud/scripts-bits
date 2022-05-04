@@ -5,14 +5,14 @@ def GetWeatherString(cityName,countryCode):
     limit=1
     apiKeyFile="apiKeyOpenweathermap.txt"
     with open(apiKeyFile) as f:
-        apiKey=f.read()
+        apiKey=f.read().strip()
 
     url=f"http://api.openweathermap.org/geo/1.0/direct?q={cityName},{countryCode}&limit={limit}&appid={apiKey}"
     response = requests.get(url).text
     response=response.rstrip(']')
     response=response.lstrip('[')
     city=json.loads(response)
-
+   
     units="metric"
     lat=city["lat"]
     lon=city["lon"]
