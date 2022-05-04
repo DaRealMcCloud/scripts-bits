@@ -20,9 +20,6 @@ ax.set_xlabel('Datum')
 
 ax2 = ax.twinx()
 
-
-
-
 ax.set_ylabel('Pegel in cm') 
 x = []
 y = []
@@ -36,10 +33,20 @@ x2 = []
 y2 = []
 for line in lineListWeather:
     x2.append(datetime.strptime(line.split(",")[0], "%d.%m.%Y:%H:%M") )
-    y2.append(float(line.split(",")[2].split(':')[1].split(' ')[0]))
-ax2.plot(x2, y2, color='red')
+    y2.append(float(line.split(",")[2].split(':')[1]))
+ax.plot(x2, y2, color='red')
 
-#Hummidity in %
+
+ax2 = ax.twinx()
+ax2.set_ylabel("Hummidity in %")
+x3 = []
+y3 = []
+for line in lineListWeather:
+    x3.append(datetime.strptime(line.split(",")[0], "%d.%m.%Y:%H:%M") )
+    y3.append(float(line.split(",")[3].split(':')[1]))
+ax2.plot(x3, y3, color='yellow')
+
+
 #Air pressure grnd level in hPa
 
 plt.title('Pegel Prüm! in cm')
