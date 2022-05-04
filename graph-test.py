@@ -18,6 +18,7 @@ ax.set_ylabel('Pegel')
 
 ax2 = ax.twinx()
 ax2.set_ylabel("Temperatur")
+ax2.plot()
 
 # x and y axis values
 x = []
@@ -25,6 +26,12 @@ y = []
 for line in lineListPegel:
     x.append(datetime.strptime(line.split(",")[0]+":"+line.split(",")[1], "%d.%m.%Y:%H:%M") )
     y.append(int(line.split(",")[2]))
+
+x2 = []
+y2 = []
+for line in lineListPegel:
+    x2.append(datetime.strptime(line.split(",")[0]+":"+line.split(",")[1], "%d.%m.%Y:%H:%M") )
+    y2.append(int(line.split(",")[2]))
 
 plt.title('Pegel Prüm! in cm')
 ax.plot(x, y, color='blue')

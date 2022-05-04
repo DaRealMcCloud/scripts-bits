@@ -74,6 +74,6 @@ while True:
     weatherString=GetWeatherString("Prüm","DE")
     today=datetime.now()
     with open(csvFileWeather,'a') as f:
-        f.write(today.strftime("%d.%m.%Y:%H:%M")+weatherString+"\n")
+        f.write(today.strftime("%d.%m.%Y:%H:%M")+','+weatherString+"\n")
     
     time.sleep(900)
