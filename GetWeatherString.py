@@ -24,10 +24,11 @@ def GetWeatherString(cityName,countryCode):
     response = requests.get(url).text
     weather=json.loads(response)
         
-    weatherString = weather["name"]+",Temp:"+str(weather["main"]["temp"])+" C,Humidity:"+str(weather["main"]["humidity"])+" %,Pressure:"+str(weather["main"]["grnd_level"])+" hPa."
+    weatherString = weather["name"]+",Temp:"+str(weather["main"]["temp"])+",Humidity:"+str(weather["main"]["humidity"])+",Pressure:"+str(weather["main"]["grnd_level"])
     try:
         weatherString=weatherString+str(weather["rain"]["rain.1h"])
     except:
         print("No rain in the last hour")
+        #print(weather)
 
     return weatherString
