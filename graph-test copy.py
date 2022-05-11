@@ -42,9 +42,9 @@ for line in lineListWeather:
 p3, = twin2.plot(x3, y3, "g-", label="Humidity")
 
 #ax.set_xlim(0, 2)
-#ax.set_ylim(0, 2)
-#twin1.set_ylim(0, 4)
-#twin2.set_ylim(1, 65)
+ax.set_ylim(0, 100)
+twin1.set_ylim(-10, 40)
+twin2.set_ylim(0, 100)
 
 ax.set_xlabel("Date")
 ax.set_ylabel("Pegel")
