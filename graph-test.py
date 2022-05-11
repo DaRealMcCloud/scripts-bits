@@ -20,6 +20,7 @@ ax.set_xlabel('Datum')
 
 ax2 = ax.twinx()
 
+
 ax.set_ylabel('Pegel in cm') 
 x = []
 y = []
