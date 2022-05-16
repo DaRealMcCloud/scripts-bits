@@ -39,7 +39,7 @@ y3 = []
 for line in lineListWeather:
     x3.append(datetime.strptime(line.split(",")[0], "%d.%m.%Y:%H:%M") )
     y3.append(float(line.split(",")[3].split(':')[1]))
-p3, = twin2.plot(x3, y3, "g-", label="Humidity")
+#p3, = twin2.plot(x3, y3, "g-", label="Humidity")
 
 #ax.set_xlim(0, 2)
 ax.set_ylim(0, 100)
@@ -53,14 +53,14 @@ twin2.set_ylabel("Humidity")
 
 ax.yaxis.label.set_color(p1.get_color())
 twin1.yaxis.label.set_color(p2.get_color())
-twin2.yaxis.label.set_color(p3.get_color())
+#twin2.yaxis.label.set_color(p3.get_color())
 
 tkw = dict(size=4, width=1.5)
 ax.tick_params(axis='y', colors=p1.get_color(), **tkw)
 twin1.tick_params(axis='y', colors=p2.get_color(), **tkw)
-twin2.tick_params(axis='y', colors=p3.get_color(), **tkw)
+#twin2.tick_params(axis='y', colors=p3.get_color(), **tkw)
 ax.tick_params(axis='x', **tkw)
 
-ax.legend(handles=[p1, p2, p3])
+ax.legend(handles=[p1, p2])#, p3])
 
 plt.show()
