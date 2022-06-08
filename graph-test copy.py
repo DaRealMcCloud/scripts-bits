@@ -60,7 +60,7 @@ for line in lineListWeather:
         x.append(datetime.strptime(line.split(",")[0], "%d.%m.%Y:%H:%M") )
         y.append(float(line.split(",")[5].split(':')[1]))
 if showRain == True:
-    p4, = twin3.plot(x, y, "g-", label="Rain")
+    p4 = twin3.bar(x, y, width=0.1)
     #plot replaced with bars
 
 #ax.set_xlim(0, 2)
