@@ -21,16 +21,19 @@ export async function main(ns) {
 
 
     while(true){
-
+        ns.sleep(20)
         do{
+            ns.sleep(20);
             sleepTimeHack = ns.getHackTime(target);
             sleepTimeGrow = ns.getGrowTime(target);
             sleepTimeWeaken = ns.getWeakenTime(target);
 
-            var player = ns.getPlayer()
+            var player = ns.getPlayer();
             var server = ns.getServer(target);
-            //calculate needed hack threads to get 'moneyRatio' 
 
+            var availableMoney = ns.getServerMoneyAvailable(target);
+
+            // calculate needed hack threads to get 'moneyRatio' 
             if (ns.fileExists("Formulas.exe", "home")) {
 				hackThreads = Math.ceil(moneyRatio / ns.formulas.hacking.hackPercent(server, player))
 			} else {
@@ -41,7 +44,7 @@ export async function main(ns) {
 			growthFactor = maxMoney / (availableMoney - (availableMoney * moneyRatio));
 			if (growthFactor < 1) {
 				growthFactor = 1;
-				ns.print("Growth factor under 0. MaxMoney:", maxMoney, " , Money: ", availbleMoney, " , Money Ratio: ", moneyRatio);
+				ns.print("Growth factor under 0. MaxMoney:", maxMoney, " , Money: ", availableMoney, " , Money Ratio: ", moneyRatio);
 			}
 
             if (ns.fileExists("Formulas.exe", "home") == true) {
@@ -53,7 +56,7 @@ export async function main(ns) {
 						growThreads = i+1;
 						break;
 					}
-					//await ns.sleep(1000);
+					await ns.sleep(20);
 				}
 			}
 			else {
@@ -85,7 +88,7 @@ export async function main(ns) {
                 // sweetspot
             }
 
-            ns.sleep(20);
+            
 
         }while(memoryUsage > maxMemory)
 
@@ -110,7 +113,7 @@ export async function main(ns) {
             ns.sleep(1000)
         }
 
-        ns.sleep(20)
+        
     }
 
 }
