@@ -59,7 +59,7 @@ while True:
 					existingLines=f.read().splitlines()
 					#print(existingLines)
 					#quit()
-	
+	                        
 				for dataPoint in dataList:
 					existingLineFound=False
 					for existingLine in existingLines:
