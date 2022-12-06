@@ -51,26 +51,28 @@ while True:
 			print("Data gathered")
 			dataList.reverse()
 			#print(dataList)
+			print(len(dataList))
 	
 	
 			if os.path.isfile(csvFileName):
-				print("Append to existing file")
-				with open(csvFileName) as f:
-					existingLines=f.read().splitlines()
-					#print(existingLines)
-					#quit()
+				if len(dataList) > 0:
+					print("Append to existing file")
+					with open(csvFileName) as f:
+						existingLines=f.read().splitlines()
+						#print(existingLines)
+						#quit()
 	                        
-				for dataPoint in dataList:
-					existingLineFound=False
-					for existingLine in existingLines:
-						#print("check" + existingLine)
-						if existingLine == dataPoint:
-							existingLineFound=True
+					for dataPoint in dataList:
+						existingLineFound=False
+						for existingLine in existingLines:
+							#print("check" + existingLine)
+							if existingLine == dataPoint:
+								existingLineFound=True
 	
-					if existingLineFound == False:
-						print("adding :" + dataPoint)
-						with open(csvFileName,'a') as f:
-							f.write(dataPoint+"\n")
+						if existingLineFound == False:
+							print("adding :" + dataPoint)
+							with open(csvFileName,'a') as f:
+								f.write(dataPoint+"\n")
 			else:
 				print("File does not exist.Creating")
 				with open('pegelPruem.csv',"x") as f:
@@ -83,6 +85,10 @@ while True:
 				f.write(today.strftime("%d.%m.%Y:%H:%M")+','+weatherString+"\n")
 			
 			time.sleep(900)
-	except:
-		print("Error happened in the script");
+	except KeyboardInterrupt:
+		print("Quitting")
+		quit()
+	except Exception as e:
+		print("Error happened in the script")
+		print(e)
 	
