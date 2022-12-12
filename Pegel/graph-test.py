@@ -6,11 +6,11 @@ import matplotlib.pyplot as plt
 import numpy as np
 from datetime import datetime
 
-csvPegelFileName='pegelPruem.csv'
+csvPegelFileName='Pegel\pegelPruem.csv'
 with open(csvPegelFileName) as f:
     lineListPegel=f.read().splitlines()
 
-csvWeatherFileName='weatherPruem.csv'
+csvWeatherFileName='Pegel\weatherPruem.csv'
 with open(csvWeatherFileName) as f:
     lineListWeather=f.read().splitlines()
 
