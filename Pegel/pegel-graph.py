@@ -43,7 +43,7 @@ for line in lineListWeather:
 
 #ax.set_xlim(0, 2)
 ax.set_ylim(0, 100)
-twin1.set_ylim(-10, 40)
+twin1.set_ylim(-15, 40)
 twin2.set_ylim(0, 100)
 
 ax.set_xlabel("Date")
