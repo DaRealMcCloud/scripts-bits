@@ -44,7 +44,8 @@ while true; do
   if [ "$(date +%H%M)" == "0000" ]; then
     # Combine the pictures into a video using ffmpeg
     VIDEO_FILENAME=$(date +%Y-%m-%d).mp4
-    ffmpeg -framerate 1/60 -pattern_type glob -i "$IMAGES_DIR/*.jpg" -c:v libx264 -r 30 -pix_fmt yuv420p "$DAILY_VIDEOS_DIR/$VIDEO_FILENAME"
+    ffmpeg -framerate 1/60 -pattern_type glob -i "$IMAGES_DIR/*.jpg" -c:v libx264 -r 60 -pix_fmt yuv420p "$DAILY_VIDEOS_DIR/$VIDEO_FILENAME"
+    #ffmpeg -framerate 1/60 -pattern_type glob -i "/mnt/timelapse/images/*.jpg" -c:v libx264 -r 60 -pix_fmt yuv420p "/mnt/timelapse/daily_videos/testVid.mp4"
 
     # Remove the images from the previous day
     rm -f "$IMAGES_DIR/*.jpg"
