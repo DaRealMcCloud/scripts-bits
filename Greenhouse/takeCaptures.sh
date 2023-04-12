@@ -61,3 +61,10 @@ while true; do
     fi
   fi
 done
+
+
+
+
+#fswebcam -d /dev/video2 --set "White Balance Temperature, Auto"=False --set "White Balance Temperature"=3500 --set "LED1 Mode"=Off --set "Exposure, Auto"="Manual Mode" --set "Exposure, Auto Priority"=False --set "Exposure (Absolute)"=10 --set "Backlight Compensation"=0 --set Gain=0 --set "Zoom, Absolute"=100 --delay 1 --skip 200 -r 2560x1440 output4k-2.jpg
+#fswebcam -d /dev/video2 --set "White Balance Temperature, Auto"=False --set "White Balance Temperature"=3500 --set "LED1 Mode"=Off --set "Exposure, Auto Priority"=False --set "Exposure (Absolute)"=10 --set "Backlight Compensation"=0 --set Gain=0 --set "Zoom, Absolute"=100 --set "Exposure, Auto"="Manual Mode" --delay 5 --skip 200 -r 2560x1440 --flip h,v --no-banner --jpeg 95 -q output4k-5.jpg
+#fswebcam -d /dev/video2 --set "White Balance Temperature, Auto"=False --set "White Balance Temperature"=3500 --set "LED1 Mode"=Off --set "Exposure, Auto Priority"=False --set "Exposure (Absolute)"=10 --set "Backlight Compensation"=0 --set Gain=0 --set "Zoom, Absolute"=100 --set "Exposure, Auto"="Manual Mode" --delay 5 --skip 200 -r 2560x1440 --flip h,v --no-banner --jpeg 95 -q output4k-5.jpg
