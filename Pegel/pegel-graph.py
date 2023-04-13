@@ -1,11 +1,11 @@
 import matplotlib.pyplot as plt
 from datetime import datetime
 
-csvPegelFileName='pegelPruem.csv'
+csvPegelFileName='Pegel\pegelPruem.csv'
 with open(csvPegelFileName) as f:
     lineListPegel=f.read().splitlines()
 
-csvWeatherFileName='weatherPruem.csv'
+csvWeatherFileName='Pegel\weatherPruem.csv'
 with open(csvWeatherFileName) as f:
     lineListWeather=f.read().splitlines()
 
@@ -43,7 +43,7 @@ for line in lineListWeather:
 
 #ax.set_xlim(0, 2)
 ax.set_ylim(0, 100)
-twin1.set_ylim(-10, 40)
+twin1.set_ylim(-15, 40)
 twin2.set_ylim(0, 100)
 
 ax.set_xlabel("Date")
