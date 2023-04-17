@@ -44,8 +44,8 @@ while true; do
   if [ "$(date +%H%M)" == "0000" ]; then
     # Combine the pictures into a video using ffmpeg
     VIDEO_FILENAME=$(date +%Y-%m-%d).mp4
-    ffmpeg -framerate 1/60 -pattern_type glob -i "$IMAGES_DIR/*.jpg" -c:v libx264 -r 50 "$DAILY_VIDEOS_DIR/$VIDEO_FILENAME"
-    #ffmpeg -pattern_type glob -i "/mnt/timelapse/images/*.jpg" -c:v libx264 -r 50 -pix_fmt yuv420p10le "/mnt/timelapse/daily_videos/testVid.mp4"
+    ffmpeg -framerate 1/60 -pattern_type glob -i "$IMAGES_DIR/*.jpg" -c:v libx264 -r 60 -pix_fmt yuv420p "$DAILY_VIDEOS_DIR/$VIDEO_FILENAME"
+    #ffmpeg -framerate 1/60 -pattern_type glob -i "/mnt/timelapse/images/*.jpg" -c:v libx264 -r 60 -pix_fmt yuv420p "/mnt/timelapse/daily_videos/testVid.mp4"
 
     # Remove the images from the previous day
     rm -f "$IMAGES_DIR/*.jpg"
@@ -61,10 +61,3 @@ while true; do
     fi
   fi
 done
-
-
-
-
-#fswebcam -d /dev/video2 --set "White Balance Temperature, Auto"=False --set "White Balance Temperature"=3500 --set "LED1 Mode"=Off --set "Exposure, Auto"="Manual Mode" --set "Exposure, Auto Priority"=False --set "Exposure (Absolute)"=10 --set "Backlight Compensation"=0 --set Gain=0 --set "Zoom, Absolute"=100 --delay 1 --skip 200 -r 2560x1440 output4k-2.jpg
-#fswebcam -d /dev/video2 --set "White Balance Temperature, Auto"=False --set "White Balance Temperature"=3500 --set "LED1 Mode"=Off --set "Exposure, Auto Priority"=False --set "Exposure (Absolute)"=10 --set "Backlight Compensation"=0 --set Gain=0 --set "Zoom, Absolute"=100 --set "Exposure, Auto"="Manual Mode" --delay 5 --skip 200 -r 2560x1440 --flip h,v --no-banner --jpeg 95 -q output4k-5.jpg
-#fswebcam -d /dev/video2 --set "White Balance Temperature, Auto"=False --set "White Balance Temperature"=3500 --set "LED1 Mode"=Off --set "Exposure, Auto Priority"=False --set "Exposure (Absolute)"=10 --set "Backlight Compensation"=0 --set Gain=0 --set "Zoom, Absolute"=100 --set "Exposure, Auto"="Manual Mode" --delay 5 --skip 200 -r 2560x1440 --flip h,v --no-banner --jpeg 95 -q output4k-5.jpg
