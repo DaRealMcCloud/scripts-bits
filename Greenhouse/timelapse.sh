@@ -59,14 +59,14 @@ while true; do
   DATE=$(date +%Y-%m-%d)
   HOUR=$(date +%H)
 
-  if ["$DATE" != "$TODAY"]; then
+  if [ "$DATE" != "$TODAY" ]; then
     $TODAY = $DATE
     $IMAGES_DIR="$NFS_MOUNT_POINT/$ENVIRONMENT_NAME/$DATE/images"
     $VIDEOS_DIR="$NFS_MOUNT_POINT/$ENVIRONMENT_NAME/$DATE"
     mkdir -p "$IMAGES_DIR"
     unset LAST_SEVEN_DAYS
     $DAY= 1
-    while [$DAY -lt 7]; do
+    while [ $DAY -lt 7 ]; do
       PAST_DAY= $(date --date="$DAY day ago")
       if [ -f "$NFS_MOUNT_POINT/$ENVIRONMENT_NAME/$PAST_DAY/daily.mp4" ]; then
         echo "$NFS_MOUNT_POINT/$ENVIRONMENT_NAME/$PAST_DAY/daily.mp4 exists."
