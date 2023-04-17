@@ -39,9 +39,9 @@ fi
 DATE=$(date +%Y-%m-%d)
 HOUR=$(date +%H)
 # Set the directory to store the images and videos
-$IMAGES_DIR="$NFS_MOUNT_POINT/$ENVIRONMENT_NAME/$DATE/images"
-$VIDEOS_DIR="$NFS_MOUNT_POINT/$ENVIRONMENT_NAME/$DATE"
-$WEEKLY_VIDEOS_DIR="$NFS_MOUNT_POINT/$ENVIRONMENT_NAME/full"
+IMAGES_DIR="$NFS_MOUNT_POINT/$ENVIRONMENT_NAME/$DATE/images"
+VIDEOS_DIR="$NFS_MOUNT_POINT/$ENVIRONMENT_NAME/$DATE"
+WEEKLY_VIDEOS_DIR="$NFS_MOUNT_POINT/$ENVIRONMENT_NAME/full"
 
 
 # Create directories if they don't exist
@@ -52,7 +52,6 @@ mkdir -p "$WEEKLY_VIDEOS_DIR"
 # Get Todays date
 TODAY=$DATE
 declare -a LAST_SEVEN_DAYS=()
-DAY=1
 
 while true; do
   # Get the current hour
@@ -60,19 +59,19 @@ while true; do
   HOUR=$(date +%H)
 
   if [ "$DATE" != "$TODAY" ]; then
-    $TODAY = $DATE
+    TODAY=$DATE
     $IMAGES_DIR="$NFS_MOUNT_POINT/$ENVIRONMENT_NAME/$DATE/images"
     $VIDEOS_DIR="$NFS_MOUNT_POINT/$ENVIRONMENT_NAME/$DATE"
     mkdir -p "$IMAGES_DIR"
     unset LAST_SEVEN_DAYS
-    $DAY= 1
+    DAY=1
     while [ $DAY -lt 7 ]; do
       PAST_DAY= $(date --date="$DAY day ago")
       if [ -f "$NFS_MOUNT_POINT/$ENVIRONMENT_NAME/$PAST_DAY/daily.mp4" ]; then
         echo "$NFS_MOUNT_POINT/$ENVIRONMENT_NAME/$PAST_DAY/daily.mp4 exists."
         $LAST_SEVEN_DAYS+="FILE $NFS_MOUNT_POINT/$ENVIRONMENT_NAME/$PAST_DAY/daily.mp4\\n"
       fi
-      $DAY=$DAY+1
+      ((DAY++))
     done
   fi
 
