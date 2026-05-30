@@ -3,9 +3,10 @@ Add-Type -MemberDefinition '[DllImport("user32.dll")] public static extern void 
 #left mouse click
 
 $waitTime = 1000
+Start-sleep -Seconds 5
 
 while($true){
-    $randomTime = Get-Random -Minimum 1 -Maximum 50
+    $randomTime = Get-Random -Minimum 1 -Maximum 5
     Start-sleep -Milliseconds ($waitTime+$randomTime)
     [W.U32]::mouse_event(6,0,0,0,0);
 }
