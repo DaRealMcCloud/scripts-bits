@@ -83,15 +83,34 @@ function Test-Internet {
 # ---------------------------------------------------------------------------
 # Initialize CSV
 # ---------------------------------------------------------------------------
-$csvHeader = "OutageNumber,OutageStart,OutageEnd,DurationSeconds,DurationFormatted"
+if (-not (Test-Path -Path $LogDir)) { New-Item -Path $LogDir -ItemType Directory -Force | Out-Null }
+
+# CSV will record outages for each monitored target (Router, NAS, Internet)
+$csvHeader = "Target,OutageNumber,OutageStart,OutageEnd,DurationSeconds,DurationFormatted,PingsSent,PacketsDropped,AvgRttMs"
 Set-Content -Path $CsvFile -Value $csvHeader
+
+# Monitoring configuration: add Router and NAS plus an Internet target
+$ReportIntervalSec = 1800 # 30 minutes for summary output
+
+$MonitoredTargets = @(
+    @{ Name = 'Router';   Addr = '10.0.0.1' },
+    @{ Name = 'NAS';      Addr = '10.0.0.10' },
+    @{ Name = 'Printer';  Addr = '10.0.0.121' },
+    @{ Name = 'Dryer';    Addr = '10.0.0.111' },
+    @{ Name = 'sw1';      Addr = '10.0.0.254' },
+    @{ Name = 'sw2';      Addr = '10.0.0.253' },
+    @{ Name = 'Internet'; Addr = $DnsTargets[0] }
+)
+
+$MonitoredTargetsDescription = $MonitoredTargets | ForEach-Object { "$($_.Name)=$($_.Addr)" } | Sort-Object | Join-String ', '
 
 Write-Log "========================================" "INFO"
 Write-Log "OutageLogger starting" "INFO"
-Write-Log "  DNS targets   : $($DnsTargets -join ', ')" "INFO"
-Write-Log "  Poll interval : ${PollIntervalSec}s" "INFO"
-Write-Log "  Ping timeout  : ${TimeoutMs}ms" "INFO"
-Write-Log "  Fail threshold: $FailThreshold consecutive failures" "INFO"
+Write-Log "  Monitored targets: $MonitoredTargetsDescription" "INFO"
+Write-Log "  DNS targets      : $($DnsTargets -join ', ')" "INFO"
+Write-Log "  Poll interval    : ${PollIntervalSec}s" "INFO"
+Write-Log "  Ping timeout     : ${TimeoutMs}ms" "INFO"
+Write-Log "  Fail threshold   : $FailThreshold consecutive failures" "INFO"
 Write-Log "  CSV log       : $CsvFile" "INFO"
 Write-Log "  Console log   : $ConsoleLog" "INFO"
 Write-Log "  Press Ctrl+C to stop and print summary" "INFO"
@@ -100,72 +119,142 @@ Write-Log "========================================" "INFO"
 # ---------------------------------------------------------------------------
 # Main loop
 # ---------------------------------------------------------------------------
-$outageCount        = 0
-$outageStart        = $null
-$consecutiveFailures = 0
-$inOutage           = $false
 $lastHeartbeat      = Get-Date
 $heartbeatMin       = 30
 $totalOutageSec     = 0
 
+# Initialize per-target state
+$targets = @{}
+foreach ($t in $MonitoredTargets) {
+    $targets[$t.Name] = [PSCustomObject]@{
+        Name = $t.Name
+        Addr = $t.Addr
+        Sent = 0
+        Failures = 0
+        SumRtt = 0
+        ConsecutiveFailures = 0
+        InOutage = $false
+        OutageCount = 0
+        OutageStart = $null
+        OutageEnd = $null
+    }
+}
+
+$nextReportTime = (Get-Date).AddSeconds($ReportIntervalSec)
+
+# We'll create per-target Ping objects and send pings concurrently below
+
 try {
     while ($true) {
-        $connected = Test-Internet -Targets $DnsTargets -Timeout $TimeoutMs
-
-        if ($connected) {
-            # --- Connection OK ---
-            if ($inOutage) {
-                # Outage just ended
-                $outageEnd      = Get-Date
-                $durationSec    = [Math]::Round(($outageEnd - $outageStart).TotalSeconds, 1)
-                $durationFmt    = ($outageEnd - $outageStart).ToString("hh\:mm\:ss")
-                $totalOutageSec += $durationSec
-
-                $csvLine = "$outageCount,$($outageStart.ToString('yyyy-MM-dd HH:mm:ss')),$($outageEnd.ToString('yyyy-MM-dd HH:mm:ss')),$durationSec,$durationFmt"
-                Add-Content -Path $CsvFile -Value $csvLine
-
-                Write-Log "OUTAGE #$outageCount ENDED — Duration: $durationFmt ($durationSec sec)" "SUCCESS"
-                $inOutage = $false
-                $lastHeartbeat = Get-Date
+        # Send pings concurrently to all targets using SendPingAsync so timestamps align
+        $sendTasks = @{}
+        foreach ($key in $targets.Keys) {
+            $t = $targets[$key]
+            $ping = New-Object System.Net.NetworkInformation.Ping
+            try {
+                $task = $ping.SendPingAsync($t.Addr, $TimeoutMs)
+            } catch {
+                # create a completed task with null result by using a helper Task
+                $task = [System.Threading.Tasks.Task]::FromResult($null)
             }
-            $consecutiveFailures = 0
+            $sendTasks[$key] = @{ Task = $task; PingObj = $ping }
+        }
 
-            # Heartbeat
-            $minutesSince = ((Get-Date) - $lastHeartbeat).TotalMinutes
-            if ($minutesSince -ge $heartbeatMin) {
-                $uptimeTotal = [Math]::Round(((Get-Date) - $StartTime).TotalHours, 1)
-                Write-Log "Heartbeat: connection stable. Monitoring for ${uptimeTotal}h, $outageCount outage(s) recorded." "SUCCESS"
-                $lastHeartbeat = Get-Date
-            }
-        } else {
-            # --- Connection FAILED ---
-            $consecutiveFailures++
+        # Wait for all tasks to complete (individual tasks respect the timeout)
+        $taskArray = $sendTasks.Values | ForEach-Object { $_.Task }
+        try {
+            if ($taskArray.Count -gt 0) { [System.Threading.Tasks.Task]::WaitAll($taskArray) }
+        } catch {
+            # ignore; we'll inspect individual task statuses below
+        }
 
-            if (-not $inOutage -and $consecutiveFailures -ge $FailThreshold) {
-                # New outage detected
-                $outageCount++
-                $outageStart = (Get-Date).AddSeconds(-($FailThreshold * $PollIntervalSec))
-                $inOutage = $true
-                Write-Log "OUTAGE #$outageCount STARTED at $($outageStart.ToString('yyyy-MM-dd HH:mm:ss'))" "ERROR"
-            } elseif (-not $inOutage) {
-                Write-Log "Ping failed ($consecutiveFailures/$FailThreshold)" "WARN"
+        # Process results for each target
+        foreach ($key in $targets.Keys) {
+            $t = $targets[$key]
+            $t.Sent++
+            $entry = $sendTasks[$key]
+            $res = $null
+            if ($entry.Task -and $entry.Task.Status -eq 'RanToCompletion') {
+                try { $res = $entry.Task.Result } catch { $res = $null }
             }
+
+            if ($res -and $res.Status -eq 'Success') {
+                $t.SumRtt += $res.RoundtripTime
+                $t.ConsecutiveFailures = 0
+
+                if ($t.InOutage) {
+                    $t.InOutage = $false
+                    $outageEnd = Get-Date
+                    $t.OutageEnd = $outageEnd
+                    $durationSec = [Math]::Round(($outageEnd - $t.OutageStart).TotalSeconds, 1)
+                    $durationFmt = ($outageEnd - $t.OutageStart).ToString("hh\:mm\:ss")
+                    $totalOutageSec += $durationSec
+
+                    $successfulPings = ($t.Sent - $t.Failures)
+                    $avgRtt = if ($successfulPings -gt 0) { [Math]::Round($t.SumRtt / $successfulPings, 1) } else { 0 }
+
+                    $csvLine = "$($t.Name),$($t.OutageCount),$($t.OutageStart.ToString('yyyy-MM-dd HH:mm:ss')),$($outageEnd.ToString('yyyy-MM-dd HH:mm:ss')),$durationSec,$durationFmt,$($t.Sent),$($t.Failures),$avgRtt"
+                    Add-Content -Path $CsvFile -Value $csvLine
+
+                    Write-Log "OUTAGE $($t.Name) #$($t.OutageCount) ENDED — Duration: $durationFmt, AvgRtt: ${avgRtt}ms, PacketsDropped: $($t.Failures) of $($t.Sent)" "SUCCESS"
+                }
+            } else {
+                $t.Failures++
+                $t.ConsecutiveFailures++
+
+                if (-not $t.InOutage -and $t.ConsecutiveFailures -ge $FailThreshold) {
+                    $t.OutageCount++
+                    $t.OutageStart = (Get-Date).AddSeconds(-($FailThreshold * $PollIntervalSec))
+                    $t.InOutage = $true
+                    Write-Log "OUTAGE $($t.Name) #$($t.OutageCount) STARTED at $($t.OutageStart.ToString('yyyy-MM-dd HH:mm:ss'))" "ERROR"
+                } elseif (-not $t.InOutage) {
+                    Write-Log "Ping failed for $($t.Name) ($($t.ConsecutiveFailures)/$FailThreshold)" "WARN"
+                }
+            }
+        }
+
+        # Periodic 5-minute summary of stats per target
+        if ((Get-Date) -ge $nextReportTime) {
+            Write-Log "----- $($ReportIntervalSec/60)-minute summary -----" "INFO"
+            foreach ($k in $targets.Keys) {
+                $t = $targets[$k]
+                $sent = $t.Sent
+                $fail = $t.Failures
+                $dropPct = if ($sent -gt 0) { [Math]::Round(($fail / $sent) * 100, 2) } else { 0 }
+                $successful = $sent - $fail
+                $avgRtt = if ($successful -gt 0) { [Math]::Round($t.SumRtt / $successful, 1) } else { 0 }
+                Write-Log "$($t.Name): Pings=$sent, Drops=$fail (${dropPct}%), AvgRtt=${avgRtt}ms" "INFO"
+            }
+            Write-Log "----------------------------" "INFO"
+            $nextReportTime = (Get-Date).AddSeconds($ReportIntervalSec)
+        }
+
+        # Heartbeat
+        $minutesSince = ((Get-Date) - $lastHeartbeat).TotalMinutes
+        if ($minutesSince -ge $heartbeatMin) {
+            $uptimeTotal = [Math]::Round(((Get-Date) - $StartTime).TotalHours, 1)
+            Write-Log "Heartbeat: monitoring for ${uptimeTotal}h" "SUCCESS"
+            $lastHeartbeat = Get-Date
         }
 
         Start-Sleep -Seconds $PollIntervalSec
     }
 }
 finally {
-    # Close any open outage
-    if ($inOutage) {
-        $outageEnd   = Get-Date
-        $durationSec = [Math]::Round(($outageEnd - $outageStart).TotalSeconds, 1)
-        $durationFmt = ($outageEnd - $outageStart).ToString("hh\:mm\:ss")
-        $totalOutageSec += $durationSec
+    # Close any open outages per target
+    foreach ($k in $targets.Keys) {
+        $t = $targets[$k]
+        if ($t.InOutage) {
+            $outageEnd = Get-Date
+            $t.OutageEnd = $outageEnd
+            $durationSec = [Math]::Round(($outageEnd - $t.OutageStart).TotalSeconds, 1)
+            $durationFmt = ($outageEnd - $t.OutageStart).ToString("hh\:mm\:ss")
+            $totalOutageSec += $durationSec
 
-        $csvLine = "$outageCount,$($outageStart.ToString('yyyy-MM-dd HH:mm:ss')),$($outageEnd.ToString('yyyy-MM-dd HH:mm:ss')),$durationSec,$durationFmt (ongoing)"
-        Add-Content -Path $CsvFile -Value $csvLine
-        Write-Log "OUTAGE #$outageCount was still ongoing — logged with current time" "WARN"
+            $csvLine = "$($t.Name),$($t.OutageCount),$($t.OutageStart.ToString('yyyy-MM-dd HH:mm:ss')),$($outageEnd.ToString('yyyy-MM-dd HH:mm:ss')),$durationSec,$durationFmt (ongoing),$($t.Sent),$($t.Failures),0"
+            Add-Content -Path $CsvFile -Value $csvLine
+            Write-Log "OUTAGE $($t.Name) #$($t.OutageCount) was still ongoing — logged with current time" "WARN"
+        }
     }
 
     # Print summary
@@ -179,7 +268,18 @@ finally {
     Write-Log "OutageLogger Summary" "INFO"
     Write-Log "  Monitoring period : $($StartTime.ToString('yyyy-MM-dd HH:mm:ss')) to $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')" "INFO"
     Write-Log "  Total runtime     : $runtimeFmt" "INFO"
-    Write-Log "  Total outages     : $outageCount" "INFO"
+
+    # Per-target summary
+    foreach ($k in $targets.Keys) {
+        $t = $targets[$k]
+        $sent = $t.Sent
+        $fail = $t.Failures
+        $dropPct = if ($sent -gt 0) { [Math]::Round(($fail / $sent) * 100, 3) } else { 0 }
+        $successful = $sent - $fail
+        $avgRtt = if ($successful -gt 0) { [Math]::Round($t.SumRtt / $successful, 1) } else { 0 }
+        Write-Log "  $($t.Name) — Pings: $sent, Drops: $fail (${dropPct}%), AvgRtt: ${avgRtt}ms, Outages: $($t.OutageCount)" "INFO"
+    }
+
     Write-Log "  Total downtime    : $([Math]::Round($totalOutageSec, 1))s" "INFO"
     Write-Log "  Uptime            : $uptimePercent%" "INFO"
     Write-Log "  CSV report        : $CsvFile" "INFO"
