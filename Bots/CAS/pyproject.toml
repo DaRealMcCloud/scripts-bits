@@ -1,0 +1,67 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "alpaca-trader"
+version = "0.1.0"
+description = "Broker-neutral algorithmic trading bot (Alpaca + Interactive Brokers)"
+requires-python = ">=3.11"
+dependencies = [
+    "pandas>=2.2",
+    "numpy>=1.26",
+    "yfinance>=0.2",
+    "pyyaml>=6.0",
+    "apscheduler>=3.10",
+    "requests>=2.31",
+    "ta>=0.11",
+    "python-dotenv>=1.0",
+]
+
+[project.optional-dependencies]
+# Alpaca broker adapter (paper/live). Not needed when broker.provider = "ibkr".
+alpaca = [
+    "alpaca-py>=0.30.0",
+]
+# IBKR uses the Client Portal Gateway Web API over HTTP; only needs `requests`
+# (already a core dependency), so no extra package is required here.
+# Local web dashboard (FastAPI + Uvicorn).
+web = [
+    "fastapi>=0.110",
+    "uvicorn[standard]>=0.29",
+]
+# Optional machine-learning strategy backends.
+ml = [
+    "scikit-learn>=1.4",
+]
+# Optional native TA-Lib acceleration (indicators fall back to pure-Python / `ta`).
+talib = [
+    "TA-Lib>=0.4.28",
+]
+# Optional news/social sentiment providers.
+sentiment = [
+    "requests>=2.31",
+]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+]
+# Everything (except native TA-Lib, which often fails to build on Windows).
+all = [
+    "alpaca-trader[alpaca,web,ml,sentiment,dev]",
+]
+
+[project.scripts]
+# The supervisor (recommended entry point) keeps the trader alive + hosts the
+# optional web dashboard: `python -m trader.supervisor`.
+trader = "trader.main:main"
+trader-supervisor = "trader.supervisor:main"
+
+[tool.setuptools.packages.find]
+# Only package the `trader` tree; ignore runtime folders (data/, logs/) so
+# setuptools' flat-layout auto-discovery doesn't fail.
+include = ["trader*"]
+
+[tool.pytest.ini_options]
+testpaths = ["trader/tests"]
+addopts = "-q"
