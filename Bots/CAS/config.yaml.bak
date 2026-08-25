@@ -2,12 +2,10 @@
 # Trading Bot — Example Configuration
 # Copy to config.yaml and fill in values. NEVER commit config.yaml.
 #
-# Secrets come from environment variables (or a .env file), NOT this file:
+# Secrets come from environment variables, NOT this file:
 #   Alpaca : ALPACA_API_KEY, ALPACA_SECRET_KEY
 #   IBKR   : (no API key — you log into the Client Portal Gateway in a browser)
 #            optional: IBKR_ACCOUNT_ID, IBKR_BASE_URL, BROKER_PROVIDER
-#
-# Easiest: copy .env.example to .env and fill it in — the bot loads it on start.
 # ─────────────────────────────────────────────────────────────
 
 # Which broker adapter to use: "alpaca" (default) or "ibkr".
@@ -19,8 +17,7 @@ broker:
 alpaca:
   # "paper" (default, works out of the box) or "live"
   mode: paper
-  # Prefer setting ALPACA_API_KEY / ALPACA_SECRET_KEY in a .env file (or your
-  # shell) over inlining them here. See .env.example.
+  # Prefer env vars ALPACA_API_KEY / ALPACA_SECRET_KEY over inlining here.
   # api_key: ""
   # secret_key: ""
   # Historical bars (live scans, backtests, optimizer cache) come from this feed.
@@ -75,11 +72,9 @@ universe:
   # crypto pair from the broker (Alpaca only). Discovery is restricted to the
   # `crypto_quote` currency below and, if `min_crypto_volume` > 0, volume-filtered.
   crypto:
-    - BTC/USD
-    - ETH/USD
-    # - ALL/ALL   # uncomment (and remove the pairs above) to trade all crypto
+    - ALL/ALL
   # Quote currency for auto-discovered crypto (ALL/ALL only). Drops USDT/USDC/BTC
-  # duplicates. Explicit lists above are never filtered.
+  # duplicates. Explicit lists are never filtered.
   crypto_quote: USD
   # Average-daily-volume floor for auto-discovered crypto (ALL/ALL only). 0 = off.
   # Crypto volume is in base-currency units, not shares — tune with care.
@@ -87,10 +82,6 @@ universe:
 
 strategies:
   # ── Core strategies ───────────────────────────────────────
-  # Tip: the self-improvement optimizer (`python -m trader.optimize`) tunes the
-  # lookback/top_n knobs below plus the shared `risk:` block. Run it, review
-  # `data/optimize/optimize_report_<strategy>.csv`, then merge the winning
-  # `config.optimized.yaml` (or re-run with --apply). See README.
   momentum:
     enabled: true
     # Lookback windows in trading days
@@ -209,23 +200,17 @@ strategies:
 
   # ── Crypto strategies (long-only, 24/7) ──────────────────────────
   # Crypto on Alpaca is spot/cash only: no shorting, no margin, no broker-side
-  # stops/brackets, orders must be GTC. These strategies emit LONG signals only
-  # and run on their own 7-day schedule, independent of equity market hours.
+  # stops/brackets, orders must be GTC. Long-only; runs on its own 7-day loop.
   crypto:
-    # Master switch for the entire 24/7 crypto loop.
-    enabled: false
-    # How often to scan for new opportunities (minutes), all week.
+    enabled: true
     scan_interval_minutes: 15
-    # How often to check open positions against stops / take-profit (minutes).
-    # Runs more often than the opportunity scan so a fast drop can't wipe out a
+    # Check open positions against stops / take-profit every 5 min (more often
+    # than the 15-min opportunity scan) so a fast drop can't wipe out a
     # position between scans. Keep <= scan_interval_minutes.
     stop_check_interval_minutes: 5
-    # Cancel a resting (unfilled) crypto entry order once it is older than this
-    # many minutes. Crypto orders are GTC and untouched by the equity EOD
-    # flatten, so without a TTL a stuck order lingers forever and blocks new
-    # entries for that symbol (no-pyramiding guard). 0 disables the sweep.
+    # Cancel resting (unfilled) crypto entry orders older than this many minutes
+    # (crypto orders are GTC and never auto-expire otherwise). 0 disables it.
     crypto_order_ttl_minutes: 30
-    # Software trailing stop (ratchets up only). Alpaca crypto has no broker stops.
     trailing_stop: false
     trail_pct: 0.05
     momentum:
@@ -236,28 +221,26 @@ strategies:
       adx_min: 20.0
       top_n: 10
     mean_reversion:
-      enabled: false
+      enabled: true
       weight: 1.0
       lookback: 20
       zscore_entry: -2.0
       rsi_oversold: 30.0
       top_n: 10
     breakout:
-      enabled: false
+      enabled: true
       weight: 1.0
       channel: 20
       top_n: 10
     dca:
-      enabled: false
+      enabled: true
       weight: 1.0
-      # Explicit list of pairs to accumulate (e.g. [BTC/USD, ETH/USD]).
       symbols: []
       cadence_hours: 24
     volatility:
-      enabled: false
+      enabled: true
       weight: 1.0
       lookback: 20
-      # Crypto realised vol is far higher than equities; thresholds reflect that.
       low_vol_pct: 0.40
       high_vol_pct: 1.20
       top_n: 5
@@ -268,14 +251,16 @@ strategies:
       use_regime_routing: true
       regime_fit_bonus: 1.5
       regime_fit_penalty: 0.5
-      # Benchmark used to classify the crypto market regime.
       regime_benchmark: BTC/USD
 
 risk:
-  # Max fraction of equity risked per trade
-  max_risk_per_trade: 0.01
-  # Maximum number of open positions
-  max_positions: 15
+  # Max fraction of equity risked per trade.
+  # 3-5-7 rule: risk ≤3% of capital on a single trade.
+  max_risk_per_trade: 0.03
+  # Maximum number of open positions (total across equity + crypto).
+  # 3-5-7 rule: keep total exposure modest so no cluster of trades can blow up
+  # the account. ~5 concurrent positions ≈ ~15% equity at 3% risk each.
+  max_positions: 100
   # Daily drawdown limit — stop trading if equity drops by this fraction
   max_daily_drawdown: 0.05
   # ATR multiplier for trailing stop
@@ -284,18 +269,32 @@ risk:
   max_hold_days: 5
   # Flatten all intraday positions before market close
   flatten_eod: true
-  # Also flatten crypto at the equity close. Default false so 24/7 crypto
-  # positions are NOT force-closed when the stock market closes.
+  # Also flatten crypto at the equity close (default false: keep 24/7 crypto open).
   flatten_crypto_eod: false
   # Max open crypto positions, counted separately from equities (0 = unlimited).
-  max_crypto_positions: 0
+  # Cap crypto so all-5-strategies can't fully invest a small account at once.
+  max_crypto_positions: 50
+  # ── Fee-aware edge gate ───────────────────────────────────
+  # Estimated round-trip trading cost as a fraction of notional (both legs).
+  # Alpaca crypto is ~0.15-0.25% per side → ~0.005 round trip. 0 disables the gate.
+  # Per-side maker/taker fees (fractions). The fee gate uses `taker_fee_pct * 2`.
+  # Alpaca Level 1: maker 0.15% (0.0015), taker 0.25% (0.0025)
+  maker_fee_pct: 0.0015
+  taker_fee_pct: 0.0025
+  # A trade is only taken if its expected favourable move (entry→stop distance)
+  # exceeds round-trip fees by this factor. Blocks thin-margin scalps that fees
+  # would eat. 2.0 = expected edge must be ≥2× the fee drag.
+  min_edge_multiple: 2.0
+  # 3-5-7 rule: aim for ≥7% on winners. Take-profit target as a fraction above
+  # entry for crypto software exits (0 = disabled).
+  take_profit_pct: 0.07
 
 # ── Local web dashboard (optional; requires the `web` extra) ─
 web:
   # When enabled and hosted via the supervisor, serves a live dashboard.
-  enabled: false
+  enabled: true
   # Bind to loopback only. Do NOT expose publicly without an auth proxy.
-  host: 127.0.0.1
+  host: 0.0.0.0
   port: 8787
 
 logging:

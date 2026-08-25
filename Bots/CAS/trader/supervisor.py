@@ -56,6 +56,7 @@ class Supervisor:
         self._stop = threading.Event()
         self._restarts = 0
         self._child_started_at: float | None = None
+        self._started_at = time.time()
         self._backoff = 1.0
 
     # ── Child lifecycle ──────────────────────────────────────
@@ -104,6 +105,8 @@ class Supervisor:
             "running": pid is not None,
             "pid": pid,
             "uptime_seconds": round(uptime, 1),
+            # Survives child restarts, which reset uptime_seconds to zero.
+            "supervisor_uptime_seconds": round(time.time() - self._started_at, 1),
             "restarts": self._restarts,
             "last_heartbeat_age_seconds": round(self._heartbeat_age(), 1),
             "broker_provider": self.cfg.broker.provider,

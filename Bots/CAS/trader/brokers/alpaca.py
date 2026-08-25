@@ -100,6 +100,73 @@ def _retry_network(
 # app — universe, signals, stops — uses the ``BTC/USD`` canonical form).
 _CRYPTO_QUOTES = ("USDT", "USDC", "USD", "BTC", "USDG", "DAI")
 
+# Alpaca's historical data starts in 2016 on every plan; an earlier start date
+# just returns nothing, which is easy to mistake for a broken backtest.
+_ALPACA_HISTORY_START = datetime(2016, 1, 1, tzinfo=timezone.utc)
+# The free "Basic" plan serves SIP history but refuses the latest 15 minutes of
+# it (IEX has no such restriction). 16 minutes adds a little clock slack.
+_FREE_TIER_DELAY = timedelta(minutes=16)
+
+
+def _feed_name(feed) -> str:
+    """Lower-case wire name of a feed, accepting a string or a DataFeed enum."""
+    value = getattr(feed, "value", None)
+    return str(value if value is not None else feed).lower()
+
+
+def _clamp_history_window(
+    start: datetime,
+    end: datetime | None,
+    *,
+    feed=None,
+    now: datetime | None = None,
+) -> tuple[datetime, datetime]:
+    """Return a ``(start, end)`` window Alpaca will actually serve.
+
+    Naive datetimes are interpreted as UTC, ``start`` is clamped to the first
+    year Alpaca has data for, and on the SIP feed ``end`` is pulled back behind
+    the 15-minute cutoff that the free Basic plan enforces. IEX (the free feed)
+    has no recency restriction, so its ``end`` is left alone — clamping it would
+    needlessly drop the newest bars for intraday callers.
+    """
+    now = now or datetime.now(timezone.utc)
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=timezone.utc)
+    if start.tzinfo is None:
+        start = start.replace(tzinfo=timezone.utc)
+    if end is not None and end.tzinfo is None:
+        end = end.replace(tzinfo=timezone.utc)
+
+    if start < _ALPACA_HISTORY_START:
+        logger.warning(
+            "History requested from %s but Alpaca data begins %s; clamping start",
+            start.date(),
+            _ALPACA_HISTORY_START.date(),
+        )
+        start = _ALPACA_HISTORY_START
+
+    end = end or now
+    if _feed_name(feed) == "sip":
+        cutoff = now - _FREE_TIER_DELAY
+        if end > cutoff:
+            end = cutoff
+    return start, max(end, start)
+
+
+def _explain_data_error(exc: Exception, *, feed) -> None:
+    """Log an actionable hint when a data request fails on plan entitlements."""
+    text = f"{exc}".lower()
+    if not any(m in text for m in ("subscription", "forbidden", "403", "unauthorized")):
+        return
+    logger.error(
+        "Alpaca rejected the historical bar request on feed '%s': %s. The free "
+        "Basic plan covers history since 2016 with IEX real-time coverage and "
+        "withholds only the latest 15 minutes of SIP — set alpaca.data_feed to "
+        "'iex' in config.yaml, or subscribe to Algo Trader Plus to use 'sip'.",
+        _feed_name(feed),
+        exc,
+    )
+
 
 def _normalize_crypto_symbol(symbol: str) -> str:
     """Return the canonical slashed crypto form (``BTCUSD`` → ``BTC/USD``).
@@ -373,24 +440,58 @@ class AlpacaBroker(BrokerClient):
         if equity:
             from alpaca.data.requests import StockBarsRequest
 
+            eq_start, eq_end = _clamp_history_window(start, end, feed=self._feed)
+            logger.info(
+                "Fetching %s equity bars for %d symbol(s), %s → %s (feed=%s)",
+                timeframe.value,
+                len(equity),
+                eq_start.date(),
+                eq_end.date(),
+                _feed_name(self._feed),
+            )
             req = StockBarsRequest(
                 symbol_or_symbols=list(equity),
                 timeframe=atf,
-                start=start,
-                end=end,
+                start=eq_start,
+                end=eq_end,
                 feed=self._feed,
             )
-            self._extract_bars(self.stock_data.get_stock_bars(req).df, result)
+            try:
+                df = self.stock_data.get_stock_bars(req).df
+            except Exception as exc:
+                _explain_data_error(exc, feed=self._feed)
+                raise
+            self._extract_bars(df, result)
         if crypto:
             from alpaca.data.requests import CryptoBarsRequest
 
+            # Crypto history is unrestricted on every plan — no recency clamp.
+            cr_start, cr_end = _clamp_history_window(start, end)
+            logger.info(
+                "Fetching %s crypto bars for %d pair(s), %s → %s",
+                timeframe.value,
+                len(crypto),
+                cr_start.date(),
+                cr_end.date(),
+            )
             req = CryptoBarsRequest(
                 symbol_or_symbols=list(crypto),
                 timeframe=atf,
-                start=start,
-                end=end,
+                start=cr_start,
+                end=cr_end,
             )
             self._extract_bars(self.crypto_data.get_crypto_bars(req).df, result)
+
+        missing = [s for s in symbols if not result.get(s)]
+        if missing:
+            shown = ", ".join(missing[:10])
+            logger.warning(
+                "No bars returned for %d/%d symbol(s): %s%s",
+                len(missing),
+                len(symbols),
+                shown,
+                "…" if len(missing) > 10 else "",
+            )
         return result
 
     @staticmethod

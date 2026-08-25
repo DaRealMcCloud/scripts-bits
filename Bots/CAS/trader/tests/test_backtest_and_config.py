@@ -7,7 +7,12 @@ from datetime import datetime
 
 import pytest
 
-from trader.backtest import Backtester
+from trader.backtest import (
+    DEFAULT_MONTHS,
+    Backtester,
+    _resolve_start,
+    _subtract_months,
+)
 from trader.config import Config, load_config
 
 from .conftest import FakeBroker, make_bars
@@ -35,6 +40,41 @@ def test_backtest_no_data_is_flat():
     broker = FakeBroker(bars={})
     result = Backtester(Config()).run(broker, ["ZZZ"], start=datetime(2024, 1, 1))
     assert result.ending_equity == result.starting_equity
+
+
+# ── CLI window selection (--months / --days) ──────────────────────────────────
+
+
+def test_subtract_months_clamps_day_of_month():
+    # 31 March minus one month has no 31st to land on.
+    assert _subtract_months(datetime(2024, 3, 31), 1) == datetime(2024, 2, 29)
+    assert _subtract_months(datetime(2023, 3, 31), 1) == datetime(2023, 2, 28)
+
+
+def test_subtract_months_rolls_over_years():
+    assert _subtract_months(datetime(2024, 2, 15), 3) == datetime(2023, 11, 15)
+    assert _subtract_months(datetime(2024, 2, 15), 12) == datetime(2023, 2, 15)
+    assert _subtract_months(datetime(2024, 2, 15), 24) == datetime(2022, 2, 15)
+
+
+def test_resolve_start_prefers_months_then_days_then_default():
+    now = datetime(2024, 6, 15)
+    assert _resolve_start(now, months=6) == datetime(2023, 12, 15)
+    assert _resolve_start(now, days=30) == datetime(2024, 5, 16)
+    assert _resolve_start(now) == _subtract_months(now, DEFAULT_MONTHS)
+
+
+def test_backtest_run_honours_the_requested_window():
+    # 400 daily bars; a 3-month window must replay only the recent slice.
+    bars = {"AAA": make_bars("AAA", [100 + i for i in range(400)])}
+    broker = FakeBroker(equity=100_000.0, bars=bars)
+    end = bars["AAA"][-1].timestamp
+    start = _subtract_months(end, 3)
+
+    bt = Backtester(Config(), starting_equity=100_000.0)
+    result = bt.run(broker, ["AAA"], start=start, end=end)
+
+    assert all(start.date() <= ts.date() <= end.date() for ts, _ in result.equity_curve)
 
 
 @pytest.fixture

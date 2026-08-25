@@ -1,25 +1,40 @@
 """Lightweight historical backtest engine.
 
 Replays daily bars fetched from any :class:`trader.brokers.base.BrokerClient`
-through the momentum strategy logic + risk sizing, simulating fills at the next
-bar's open and applying ATR stops.  It is intentionally simple — a research aid
-to sanity-check parameters, not a tick-accurate simulator.
+through a chosen strategy's ranking logic + risk sizing, simulating fills at the
+next bar's open and applying ATR stops. It is intentionally simple — a research
+aid to sanity-check parameters, not a tick-accurate simulator.
 
-The engine reuses the neutral DTOs, so it stays broker-agnostic and shares the
-exact indicator/ATR code paths used in live trading.
+The engine reuses the neutral DTOs and the *same* indicator/ATR code paths used
+in live trading, so it stays broker-agnostic. Several strategy families can be
+replayed by swapping the ranking function (see ``STRATEGY_RANKERS``):
+
+- ``momentum``          — equity cross-sectional momentum (fast/slow lookbacks).
+- ``crypto_momentum``   — dual-MA trend with ADX filter (long-only).
+- ``crypto_volatility`` — low-volatility coil in an intact uptrend.
 
 Run with::
 
-    python -m trader.backtest --symbols AAPL,MSFT,NVDA --days 365
+    python -m trader.backtest --symbols AAPL,MSFT,NVDA --months 12
+    python -m trader.backtest --symbols BTC/USD,ETH/USD --strategy crypto_momentum --months 6
+
+Bars come from the active broker adapter (Alpaca by default, using the feed in
+``alpaca.data_feed``). Alpaca's free Basic plan serves daily history back to
+2016 and withholds only the *latest 15 minutes* of SIP data, so multi-year
+backtests need no paid subscription — note that equity coverage on the free plan
+is IEX-only, so volumes are a fraction of the consolidated tape.
 """
 
 from __future__ import annotations
 
 import argparse
+import calendar
 import logging
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 
+from trader.analysis.indicators import adx, realized_vol, sma
 from trader.brokers.base import BrokerClient
 from trader.brokers.factory import make_broker
 from trader.brokers.types import Bar, TimeFrame
@@ -28,6 +43,15 @@ from trader.logger import setup_logging
 from trader.risk.stops import compute_atr
 
 logger = logging.getLogger(__name__)
+
+# History replayed when neither --months nor --days is given.
+DEFAULT_MONTHS = 12
+
+# A ranking function scores the symbols in ``series`` as-of bar index ``idx``
+# using only bars up to and including ``idx`` (no look-ahead). It returns
+# ``(symbol, score)`` pairs sorted best-first; the engine opens the top-N with a
+# positive score that are not already held.
+RankFn = Callable[[dict[str, list["Bar"]], int, Config], list[tuple[str, float]]]
 
 
 @dataclass
@@ -78,20 +102,79 @@ class BacktestResult:
         wins = sum(1 for t in closed if t.pnl > 0)
         return wins / len(closed) * 100
 
+    @property
+    def max_drawdown_pct(self) -> float:
+        """Largest peak-to-trough decline of the mark-to-market equity curve.
+
+        Returned as a positive percentage (e.g. 12.5 == a 12.5% drawdown).
+        A flat/empty curve has zero drawdown.
+        """
+        peak = self.starting_equity
+        worst = 0.0
+        for _, eq in self.equity_curve:
+            if eq > peak:
+                peak = eq
+            if peak > 0:
+                dd = (peak - eq) / peak
+                if dd > worst:
+                    worst = dd
+        return worst * 100
+
+    @property
+    def per_symbol_pnl(self) -> dict[str, float]:
+        """Total realised P&L per symbol across all closed trades.
+
+        Used by the optimizer to penalise parameter sets whose profitability is
+        concentrated in a single symbol (an over-fit red flag).
+        """
+        out: dict[str, float] = {}
+        for t in self.trades:
+            if t.exit_price is not None:
+                out[t.symbol] = out.get(t.symbol, 0.0) + t.pnl
+        return out
+
+    @property
+    def per_symbol_return_pct(self) -> dict[str, float]:
+        """Average per-trade return% grouped by symbol (closed trades only)."""
+        acc: dict[str, list[float]] = {}
+        for t in self.trades:
+            if t.exit_price is not None:
+                acc.setdefault(t.symbol, []).append(t.return_pct)
+        return {s: sum(v) / len(v) for s, v in acc.items() if v}
+
     def summary(self) -> str:
         return (
             f"Backtest: start=${self.starting_equity:,.0f} end=${self.ending_equity:,.0f} "
             f"return={self.total_return_pct:+.2f}% trades={self.num_trades} "
-            f"win_rate={self.win_rate:.1f}%"
+            f"win_rate={self.win_rate:.1f}% max_dd={self.max_drawdown_pct:.1f}%"
         )
 
 
 class Backtester:
-    """Simple daily momentum backtest with ATR stops and fixed-fractional sizing."""
+    """Daily strategy backtest with ATR stops and fixed-fractional sizing.
 
-    def __init__(self, cfg: Config, starting_equity: float = 100_000.0) -> None:
+    ``strategy`` selects which ranking logic is replayed (see
+    ``STRATEGY_RANKERS``). The default ``momentum`` preserves the original
+    behaviour. Crypto strategies size fractionally (no whole-share flooring).
+    """
+
+    def __init__(
+        self,
+        cfg: Config,
+        starting_equity: float = 100_000.0,
+        strategy: str = "momentum",
+    ) -> None:
         self.cfg = cfg
         self.starting_equity = starting_equity
+        self.strategy = strategy
+        if strategy not in STRATEGY_RANKERS:
+            raise ValueError(
+                f"Unknown backtest strategy '{strategy}'. "
+                f"Choose from: {', '.join(sorted(STRATEGY_RANKERS))}"
+            )
+        self._rank_fn: RankFn = STRATEGY_RANKERS[strategy]
+        # Crypto is fractionable and long-only spot; equities floor to whole shares.
+        self._fractional = strategy.startswith("crypto")
 
     def run(
         self,
@@ -102,12 +185,24 @@ class Backtester:
     ) -> BacktestResult:
         end = end or datetime.now()
         bars_by_symbol = broker.get_bars(symbols, TimeFrame.DAY, start=start, end=end)
-        # Align on sorted dates per symbol.
         series = {
             s: sorted(bars, key=lambda b: b.timestamp)
             for s, bars in bars_by_symbol.items()
             if bars
         }
+        # Restrict each series to the requested [start, end] window. FakeBroker
+        # (and some adapters) ignore start/end, so we clip defensively — this is
+        # what makes walk-forward windows in the optimizer honest.
+        series = self._clip_window(series, start, end)
+        return self.run_on_series(series)
+
+    def run_on_series(self, series: dict[str, list[Bar]]) -> BacktestResult:
+        """Replay a pre-fetched, pre-sorted bar series (no broker needed).
+
+        The optimizer calls this directly on cached data so a single download
+        can be reused across thousands of parameter evaluations.
+        """
+        series = {s: b for s, b in series.items() if b}
         if not series:
             logger.warning("No historical data for backtest")
             return BacktestResult(self.starting_equity, self.starting_equity)
@@ -116,11 +211,10 @@ class Backtester:
         open_trades: dict[str, Trade] = {}
         result = BacktestResult(self.starting_equity, self.starting_equity)
 
-        # Build a unified, ordered list of dates from the longest series.
         anchor = max(series.values(), key=len)
-        slow = self.cfg.strategies.momentum.slow_lookback
+        warmup = self._warmup()
 
-        for idx in range(slow + 1, len(anchor) - 1):
+        for idx in range(warmup + 1, len(anchor) - 1):
             date = anchor[idx].timestamp
             # 1. Manage exits (ATR stop or time exit).
             for sym, trade in list(open_trades.items()):
@@ -137,20 +231,22 @@ class Backtester:
                     equity += trade.pnl
                     del open_trades[sym]
 
-            # 2. Entries: rank momentum, open top-N not already held.
-            ranked = self._rank_momentum(series, idx)
-            for sym, score in ranked[: self.cfg.strategies.momentum.top_n]:
+            # 2. Entries: rank via the selected strategy, open top-N not held.
+            ranked = self._rank_fn(series, idx, self.cfg)
+            top_n = self._top_n()
+            for sym, score in ranked[:top_n]:
                 if sym in open_trades or len(open_trades) >= self.cfg.risk.max_positions:
                     continue
-                sym_bars = series[sym]
+                sym_bars = series.get(sym, [])
                 next_bar = self._next_bar(sym_bars, date)
                 if next_bar is None or score <= 0:
                     continue
                 entry = next_bar.open
                 stop = self._stop_price(sym_bars, entry, idx)
                 risk_per_share = abs(entry - stop) or (entry * 0.02)
-                qty = float(int((equity * self.cfg.risk.max_risk_per_trade) / risk_per_share))
-                if qty < 1:
+                raw_qty = (equity * self.cfg.risk.max_risk_per_trade) / risk_per_share
+                qty = raw_qty if self._fractional else float(int(raw_qty))
+                if qty <= 0 or (not self._fractional and qty < 1):
                     continue
                 open_trades[sym] = Trade(
                     symbol=sym, entry_date=date, entry_price=entry, qty=qty
@@ -176,7 +272,41 @@ class Backtester:
         result.ending_equity = equity
         return result
 
-    # ── helpers ──────────────────────────────────────────────
+    # ── strategy sizing helpers ──────────────────────────────
+    def _warmup(self) -> int:
+        """Bars of history required before the first entry is allowed."""
+        s = self.cfg.strategies
+        if self.strategy == "momentum":
+            return max(s.momentum.slow_lookback, s.momentum.fast_lookback)
+        if self.strategy == "crypto_momentum":
+            return max(s.crypto.momentum.slow_ma, s.crypto.momentum.fast_ma, 30)
+        if self.strategy == "crypto_volatility":
+            return max(s.crypto.volatility.lookback + 5, 30)
+        return 30
+
+    def _top_n(self) -> int:
+        s = self.cfg.strategies
+        if self.strategy == "momentum":
+            return s.momentum.top_n
+        if self.strategy == "crypto_momentum":
+            return s.crypto.momentum.top_n
+        if self.strategy == "crypto_volatility":
+            return s.crypto.volatility.top_n
+        return 10
+
+    # ── bar helpers ──────────────────────────────────────────
+    @staticmethod
+    def _clip_window(
+        series: dict[str, list[Bar]], start: datetime, end: datetime
+    ) -> dict[str, list[Bar]]:
+        s_date, e_date = start.date(), end.date()
+        clipped: dict[str, list[Bar]] = {}
+        for sym, bars in series.items():
+            kept = [b for b in bars if s_date <= b.timestamp.date() <= e_date]
+            if kept:
+                clipped[sym] = kept
+        return clipped
+
     @staticmethod
     def _bar_on(bars: list[Bar], date: datetime) -> Bar | None:
         for b in bars:
@@ -198,29 +328,151 @@ class Backtester:
             return entry * 0.98
         return entry - atr * self.cfg.risk.atr_stop_multiplier
 
-    def _rank_momentum(self, series: dict[str, list[Bar]], idx: int) -> list[tuple[str, float]]:
-        fast = self.cfg.strategies.momentum.fast_lookback
-        slow = self.cfg.strategies.momentum.slow_lookback
-        scores: list[tuple[str, float]] = []
-        for sym, bars in series.items():
-            if len(bars) <= idx or idx < slow:
-                continue
-            closes = [b.close for b in bars[: idx + 1]]
-            if len(closes) < slow + 1:
-                continue
-            fast_ret = closes[-1] / closes[-fast] - 1
-            slow_ret = closes[-1] / closes[-slow] - 1
-            scores.append((sym, 0.6 * fast_ret + 0.4 * slow_ret))
-        scores.sort(key=lambda kv: kv[1], reverse=True)
-        return scores
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Strategy ranking functions (as-of ``idx``, no look-ahead)
+# ─────────────────────────────────────────────────────────────────────────────
+def _rank_momentum(
+    series: dict[str, list[Bar]], idx: int, cfg: Config
+) -> list[tuple[str, float]]:
+    """Equity cross-sectional momentum: weighted fast + slow returns."""
+    fast = cfg.strategies.momentum.fast_lookback
+    slow = cfg.strategies.momentum.slow_lookback
+    # Guard against an inverted or degenerate configuration (a candidate the
+    # optimizer might propose): both lookbacks must be >= 1 and we need enough
+    # history for the *larger* of the two.
+    need = max(fast, slow)
+    if fast < 1 or slow < 1:
+        return []
+    scores: list[tuple[str, float]] = []
+    for sym, bars in series.items():
+        if len(bars) <= idx:
+            continue
+        closes = [b.close for b in bars[: idx + 1]]
+        if len(closes) < need + 1:
+            continue
+        fast_ret = closes[-1] / closes[-fast] - 1
+        slow_ret = closes[-1] / closes[-slow] - 1
+        scores.append((sym, 0.6 * fast_ret + 0.4 * slow_ret))
+    scores.sort(key=lambda kv: kv[1], reverse=True)
+    return scores
+
+
+def _rank_crypto_momentum(
+    series: dict[str, list[Bar]], idx: int, cfg: Config
+) -> list[tuple[str, float]]:
+    """Dual-MA trend + ADX filter (mirrors ``CryptoMomentumStrategy``)."""
+    c = cfg.strategies.crypto.momentum
+    scores: list[tuple[str, float]] = []
+    for sym, bars in series.items():
+        if len(bars) <= idx:
+            continue
+        window = bars[: idx + 1]
+        fast = sma(window, c.fast_ma)
+        slow = sma(window, c.slow_ma)
+        trend = adx(window, 14)
+        if fast is None or slow is None or trend is None:
+            continue
+        if fast <= slow or trend < c.adx_min:
+            continue
+        sep = (fast - slow) / slow if slow else 0.0
+        score = max(0.0, sep) * (trend / 100.0)
+        if score > 0:
+            scores.append((sym, score))
+    scores.sort(key=lambda kv: kv[1], reverse=True)
+    return scores
+
+
+def _rank_crypto_volatility(
+    series: dict[str, list[Bar]], idx: int, cfg: Config
+) -> list[tuple[str, float]]:
+    """Low-vol coil in an intact uptrend (mirrors ``CryptoVolatilityStrategy``).
+
+    Lower volatility ranks higher, so scores are inverted (1/vol) to keep the
+    engine's ``score > 0`` / top-N convention.
+    """
+    c = cfg.strategies.crypto.volatility
+    candidates: list[tuple[str, float]] = []
+    for sym, bars in series.items():
+        if len(bars) <= idx:
+            continue
+        window = bars[: idx + 1]
+        vol = realized_vol(window, c.lookback)
+        if vol is None or vol > c.high_vol_pct or vol > c.low_vol_pct:
+            continue
+        fast = sma(window, 10)
+        if fast is None or window[-1].close < fast:
+            continue
+        # Tighter coil (lower vol) → higher score.
+        candidates.append((sym, 1.0 / (vol + 1e-9)))
+    candidates.sort(key=lambda kv: kv[1], reverse=True)
+    return candidates
+
+
+STRATEGY_RANKERS: dict[str, RankFn] = {
+    "momentum": _rank_momentum,
+    "crypto_momentum": _rank_crypto_momentum,
+    "crypto_volatility": _rank_crypto_volatility,
+}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Window selection
+# ─────────────────────────────────────────────────────────────────────────────
+def _subtract_months(dt: datetime, months: int) -> datetime:
+    """Shift ``dt`` back by whole calendar months, clamping the day of month."""
+    index = dt.month - 1 - months
+    year = dt.year + index // 12
+    month = index % 12 + 1
+    day = min(dt.day, calendar.monthrange(year, month)[1])
+    return dt.replace(year=year, month=month, day=day)
+
+
+def _resolve_start(
+    now: datetime, *, months: int | None = None, days: int | None = None
+) -> datetime:
+    """Start of the replay window; ``months`` wins, then ``days``, else default."""
+    if months is not None:
+        return _subtract_months(now, months)
+    if days is not None:
+        return now - timedelta(days=days)
+    return _subtract_months(now, DEFAULT_MONTHS)
+
+
+def _approx_bar_count(start: datetime, end: datetime, strategy: str) -> int:
+    """Rough number of bars in a window — crypto trades 7 days a week, equities 5."""
+    per_week = 7 if strategy.startswith("crypto") else 5
+    return int(max((end - start).days, 0) * per_week / 7)
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Run a simple momentum backtest")
+    parser = argparse.ArgumentParser(description="Run a simple daily backtest")
     parser.add_argument("--symbols", required=True, help="Comma-separated tickers")
-    parser.add_argument("--days", type=int, default=365)
+    window = parser.add_mutually_exclusive_group()
+    window.add_argument(
+        "--months",
+        type=int,
+        default=None,
+        help=f"How many past months to replay (default: {DEFAULT_MONTHS})",
+    )
+    window.add_argument(
+        "--days",
+        type=int,
+        default=None,
+        help="Alternative to --months: window length in calendar days",
+    )
     parser.add_argument("--equity", type=float, default=100_000.0)
+    parser.add_argument(
+        "--strategy",
+        default="momentum",
+        choices=sorted(STRATEGY_RANKERS),
+        help="Which strategy's ranking logic to replay",
+    )
     args = parser.parse_args()
+    if args.months is not None and args.months < 1:
+        parser.error("--months must be >= 1")
+    if args.days is not None and args.days < 1:
+        parser.error("--days must be >= 1")
 
     cfg = load_config("config.yaml")
     setup_logging(cfg)
@@ -229,10 +481,24 @@ def main() -> None:
     broker.connect()
 
     symbols = [s.strip().upper() for s in args.symbols.split(",") if s.strip()]
-    start = datetime.now() - timedelta(days=args.days)
+    end = datetime.now()
+    start = _resolve_start(end, months=args.months, days=args.days)
 
-    bt = Backtester(cfg, starting_equity=args.equity)
-    result = bt.run(broker, symbols, start)
+    bt = Backtester(cfg, starting_equity=args.equity, strategy=args.strategy)
+    print(
+        f"Replaying '{args.strategy}' over {len(symbols)} symbol(s), "
+        f"{start.date()} → {end.date()}"
+    )
+    warmup = bt._warmup()
+    approx_bars = _approx_bar_count(start, end, args.strategy)
+    if approx_bars <= warmup:
+        print(
+            f"WARNING: ~{approx_bars} bars fit in this window but '{args.strategy}' "
+            f"needs {warmup} bars of warm-up before its first entry — expect no "
+            f"trades. Widen the window with --months."
+        )
+
+    result = bt.run(broker, symbols, start, end)
     print(result.summary())
     for t in result.trades:
         if t.exit_price is not None:

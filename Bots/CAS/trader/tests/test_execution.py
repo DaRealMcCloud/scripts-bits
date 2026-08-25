@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import pytest
+
 from trader.brokers.base import BrokerCapabilities, InstrumentIdKind
 from trader.brokers.types import Quote
 from trader.config import Config
@@ -328,4 +330,382 @@ def test_drawdown_halt_blocks_new_orders(tmp_path):
     sig = Signal("CCC", SignalDirection.LONG, 0.9, "test", "unit", stop_hint=9.0)
     assert mgr.execute_signal(sig) is None
     assert broker.submitted == []
+    store.close()
+
+
+# ── Equity history: full-span curve + all-time baseline ───────────────────────
+# The dashboard used to derive Total Return from the newest N snapshots, so a
+# bot snapshotting every heartbeat showed the return of the last few days only.
+
+
+def _seed_equity(store, rows):
+    """Insert (ts, equity, cash) snapshots directly, bypassing 'now' stamping."""
+    store._conn.executemany(
+        "INSERT OR REPLACE INTO equity_snapshots (ts, equity, cash, unrealized_pl) "
+        "VALUES (?,?,?,?)",
+        [(ts, eq, cash, 0.0) for ts, eq, cash in rows],
+    )
+    store._conn.commit()
+
+
+def _linear_history(n, start_equity, end_equity, cash=0.0):
+    from datetime import datetime, timedelta, timezone
+
+    t0 = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    step = (end_equity - start_equity) / (n - 1)
+    return [
+        ((t0 + timedelta(minutes=i)).isoformat(), start_equity + step * i, cash)
+        for i in range(n)
+    ]
+
+
+def test_first_equity_returns_oldest_snapshot(tmp_path):
+    store = StateStore(db_path=tmp_path / "state.db")
+    _seed_equity(store, _linear_history(50, 5000.0, 5873.0))
+    first = store.first_equity()
+    assert first is not None
+    assert first["equity"] == 5000.0
+    assert first["ts"] < store.latest_equity()["ts"]
+    store.close()
+
+
+def test_equity_curve_spans_full_history_and_downsamples(tmp_path):
+    store = StateStore(db_path=tmp_path / "state.db")
+    _seed_equity(store, _linear_history(500, 5000.0, 5873.0))
+
+    curve = store.equity_curve(max_points=50)
+    assert 2 <= len(curve) <= 51
+    # Both ends of the history survive the thinning.
+    assert curve[0]["equity"] == 5000.0
+    assert curve[-1]["equity"] == 5873.0
+    store.close()
+
+
+def test_metrics_total_return_uses_first_ever_snapshot(tmp_path):
+    """5000 → 5873 is +17.5%, no matter how many snapshots sit in between."""
+    from trader.web.app import _compute_metrics
+
+    store = StateStore(db_path=tmp_path / "state.db")
+    _seed_equity(store, _linear_history(6000, 5000.0, 5873.0))
+
+    m = _compute_metrics(store)
+    assert m["start_equity"] == 5000.0
+    assert m["current_equity"] == 5873.0
+    assert m["total_return_pct"] == pytest.approx(17.46, abs=0.01)
+    store.close()
+
+
+def _recent_history(days, per_day=4, start_equity=1000.0, step=1.0):
+    """Snapshots spread over the last ``days`` days, ending now."""
+    from datetime import datetime, timedelta, timezone
+
+    now = datetime.now(timezone.utc)
+    rows = []
+    total = days * per_day
+    for i in range(total):
+        ts = now - timedelta(days=days) + timedelta(hours=i * 24 / per_day)
+        rows.append((ts.isoformat(), start_equity + step * i, 0.0))
+    return rows
+
+
+def test_equity_curve_since_limits_the_window(tmp_path):
+    from datetime import datetime, timedelta, timezone
+
+    store = StateStore(db_path=tmp_path / "state.db")
+    _seed_equity(store, _recent_history(days=30))
+
+    cutoff = datetime.now(timezone.utc) - timedelta(days=7)
+    curve = store.equity_curve(since=cutoff.isoformat())
+
+    assert curve, "expected snapshots inside the 7-day window"
+    assert all(row["ts"] >= cutoff.isoformat() for row in curve)
+    assert len(curve) < len(store.equity_curve())
+    store.close()
+
+
+def test_metrics_chart_days_narrows_curve_but_not_returns(tmp_path):
+    from datetime import datetime, timedelta, timezone
+
+    from trader.web.app import _compute_metrics
+
+    store = StateStore(db_path=tmp_path / "state.db")
+    _seed_equity(store, _recent_history(days=30))
+
+    all_time = _compute_metrics(store)
+    windowed = _compute_metrics(store, chart_days=7)
+
+    assert windowed["chart_days"] == 7
+    assert len(windowed["equity_series"]) < len(all_time["equity_series"])
+    # Headline figures stay all-time regardless of the chart window.
+    assert windowed["total_return_pct"] == all_time["total_return_pct"]
+    assert windowed["start_equity"] == all_time["start_equity"]
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
+    assert windowed["equity_series"][0]["t"] >= cutoff
+    store.close()
+
+
+def test_metrics_positions_value_is_equity_minus_cash(tmp_path):
+    from trader.web.app import _compute_metrics
+
+    store = StateStore(db_path=tmp_path / "state.db")
+    store.record_equity(5873.0, cash=1000.0, unrealized_pl=73.0)
+    store.replace_positions(
+        [
+            {
+                "symbol": "BTC/USD",
+                "qty": 1.0,
+                "avg_entry_price": 4000.0,
+                "current_price": 4873.0,
+                "market_value": 4873.0,
+                "unrealized_pl": 873.0,
+                "unrealized_pl_pct": 21.8,
+            }
+        ]
+    )
+
+    m = _compute_metrics(store)
+    assert m["positions_value"] == 4873.0
+    # Equity is cash + holdings, so the two cards no longer show the same number.
+    assert m["current_equity"] == m["current_cash"] + m["positions_value"]
+    store.close()
+
+
+def test_metrics_positions_value_without_snapshot_falls_back(tmp_path):
+    """With no cash recorded, the per-symbol snapshot supplies the holdings."""
+    from trader.web.app import _compute_metrics
+
+    store = StateStore(db_path=tmp_path / "state.db")
+    store._conn.execute(
+        "INSERT INTO equity_snapshots (ts, equity, cash, unrealized_pl) "
+        "VALUES ('2026-01-01T00:00:00+00:00', 5873.0, NULL, 73.0)"
+    )
+    store._conn.commit()
+    store.replace_positions(
+        [
+            {
+                "symbol": "BTC/USD",
+                "qty": 1.0,
+                "avg_entry_price": 4000.0,
+                "current_price": 4873.0,
+                "market_value": 4873.0,
+                "unrealized_pl": 873.0,
+                "unrealized_pl_pct": 21.8,
+            }
+        ]
+    )
+
+    m = _compute_metrics(store)
+    assert m["current_cash"] is None
+    assert m["positions_value"] == pytest.approx(4873.0)
+    store.close()
+
+
+def test_metrics_top_winners_and_losers(tmp_path):
+    from trader.execution.state_store import OrderRecord
+    from trader.web.app import _compute_metrics
+
+    store = StateStore(db_path=tmp_path / "state.db")
+
+    def _order(oid, symbol, side, qty, price, ts):
+        store.record_order(
+            OrderRecord(
+                order_id=oid,
+                symbol=symbol,
+                side=side,
+                qty=qty,
+                limit_price=price,
+                stop_price=None,
+                strategy="unit",
+                reason="test",
+                status="filled",
+                created_at=ts,
+            )
+        )
+
+    # 12 round-trips: 6 winners of +100..+600, 6 losers of -100..-600.
+    day = 1
+    for i in range(1, 7):
+        _order(f"w{i}b", f"W{i}", "buy", 10, 100.0, f"2026-01-{day:02d}T00:00:00+00:00")
+        _order(f"w{i}s", f"W{i}", "sell", 10, 100.0 + i * 10, f"2026-01-{day + 1:02d}T00:00:00+00:00")
+        _order(f"l{i}b", f"L{i}", "buy", 10, 100.0, f"2026-02-{day:02d}T00:00:00+00:00")
+        _order(f"l{i}s", f"L{i}", "sell", 10, 100.0 - i * 10, f"2026-02-{day + 1:02d}T00:00:00+00:00")
+        day += 2
+
+    m = _compute_metrics(store)
+    winners, losers = m["top_winners"], m["top_losers"]
+
+    assert [t["symbol"] for t in winners] == ["W6", "W5", "W4", "W3", "W2", "W1"]
+    assert [t["symbol"] for t in losers] == ["L6", "L5", "L4", "L3", "L2", "L1"]
+    assert winners[0]["realized_pl"] == 600.0
+    assert losers[0]["realized_pl"] == -600.0
+    # Only genuinely profitable / losing trades appear in each list.
+    assert all(t["realized_pl"] > 0 for t in winners)
+    assert all(t["realized_pl"] < 0 for t in losers)
+    store.close()
+
+
+def test_metrics_top_trades_capped_at_ten(tmp_path):
+    from trader.execution.state_store import OrderRecord
+    from trader.web.app import _compute_metrics
+
+    store = StateStore(db_path=tmp_path / "state.db")
+    for i in range(1, 15):
+        for side, price, ts in (
+            ("buy", 100.0, f"2026-03-{i:02d}T00:00:00+00:00"),
+            ("sell", 100.0 + i, f"2026-03-{i:02d}T12:00:00+00:00"),
+        ):
+            store.record_order(
+                OrderRecord(
+                    order_id=f"{side}-{i}",
+                    symbol=f"S{i}",
+                    side=side,
+                    qty=1,
+                    limit_price=price,
+                    stop_price=None,
+                    strategy="unit",
+                    reason="test",
+                    status="filled",
+                    created_at=ts,
+                )
+            )
+
+    m = _compute_metrics(store)
+    assert len(m["top_winners"]) == 10
+    assert m["top_losers"] == []
+    store.close()
+
+
+# ── Per-strategy performance table ────────────────────────────────────────────
+
+
+def _strategy_store(tmp_path):
+    """Two strategies trading the same-ish setup: one profitable, one not."""
+    from trader.execution.state_store import OrderRecord
+
+    store = StateStore(db_path=tmp_path / "state.db")
+
+    def _order(oid, symbol, side, qty, price, strategy, ts):
+        store.record_order(
+            OrderRecord(
+                order_id=oid,
+                symbol=symbol,
+                side=side,
+                qty=qty,
+                limit_price=price,
+                stop_price=None,
+                strategy=strategy,
+                reason="test",
+                status="filled",
+                created_at=ts,
+            )
+        )
+
+    # momentum: buy 10 @100 → sold by a stop at 120 → +200 for MOMENTUM.
+    _order("1", "AAA", "buy", 10, 100.0, "momentum", "2026-01-01T00:00:00+00:00")
+    _order("2", "AAA", "sell", 10, 120.0, "crypto_stop", "2026-01-02T00:00:00+00:00")
+    # crypto_momentum: buy 10 @100 → closed at 90 → -100.
+    _order("3", "BBB", "buy", 10, 100.0, "crypto_momentum", "2026-01-03T00:00:00+00:00")
+    _order("4", "BBB", "sell", 10, 90.0, "crypto_take_profit", "2026-01-04T00:00:00+00:00")
+    return store
+
+
+def test_strategy_performance_credits_the_opening_strategy(tmp_path):
+    """The exit tag (crypto_stop) must not be credited with the P/L."""
+    from trader.web.app import _compute_metrics
+
+    store = _strategy_store(tmp_path)
+    rows = {r["name"]: r for r in _compute_metrics(store)["strategies"]}
+
+    assert rows["momentum"]["realized_pl"] == 200.0
+    assert rows["momentum"]["wins"] == 1
+    assert rows["momentum"]["closed_trades"] == 1
+    assert rows["momentum"]["realized_pl_pct"] == pytest.approx(20.0)
+    assert rows["crypto_momentum"]["realized_pl"] == -100.0
+    assert rows["crypto_momentum"]["losses"] == 1
+    # The exit tags carry no P/L of their own.
+    assert "crypto_stop" not in rows
+    assert "crypto_take_profit" not in rows
+    store.close()
+
+
+def test_strategy_performance_lists_configured_strategies_with_status(tmp_path):
+    from trader.config import Config
+    from trader.web.app import _compute_metrics
+
+    cfg = Config()
+    cfg.strategies.momentum.enabled = True
+    cfg.strategies.breakout.enabled = False
+    cfg.strategies.crypto.enabled = True
+    cfg.strategies.crypto.momentum.enabled = True
+    cfg.strategies.crypto.volatility.enabled = False
+
+    store = _strategy_store(tmp_path)
+    rows = {r["name"]: r for r in _compute_metrics(store, cfg=cfg)["strategies"]}
+
+    assert rows["momentum"]["enabled"] is True
+    assert rows["momentum"]["kind"] == "equity"
+    assert rows["crypto_momentum"]["enabled"] is True
+    assert rows["crypto_momentum"]["kind"] == "crypto"
+    assert rows["crypto_volatility"]["enabled"] is False
+    # Enabled but never traded still shows up, with zeros.
+    assert rows["breakout"]["enabled"] is False
+    assert rows["breakout"]["orders"] == 0
+    assert rows["breakout"]["realized_pl"] == 0.0
+    store.close()
+
+
+def test_strategy_performance_crypto_off_disables_children(tmp_path):
+    from trader.config import Config
+    from trader.web.app import _compute_metrics
+
+    cfg = Config()
+    cfg.strategies.crypto.enabled = False
+    cfg.strategies.crypto.momentum.enabled = True
+
+    store = _strategy_store(tmp_path)
+    rows = {r["name"]: r for r in _compute_metrics(store, cfg=cfg)["strategies"]}
+
+    # The child switch is on but the crypto loop is off → not active.
+    assert rows["crypto_momentum"]["enabled"] is False
+    store.close()
+
+
+def test_strategy_performance_tracks_open_exposure(tmp_path):
+    from trader.execution.state_store import OrderRecord
+    from trader.web.app import _compute_metrics
+
+    store = StateStore(db_path=tmp_path / "state.db")
+    store.record_order(
+        OrderRecord(
+            order_id="open-1",
+            symbol="BTC/USD",
+            side="buy",
+            qty=1.0,
+            limit_price=4000.0,
+            stop_price=None,
+            strategy="crypto_volatility",
+            reason="test",
+            status="filled",
+            created_at="2026-01-05T00:00:00+00:00",
+        )
+    )
+    store.replace_positions(
+        [
+            {
+                "symbol": "BTC/USD",
+                "qty": 1.0,
+                "avg_entry_price": 4000.0,
+                "current_price": 4500.0,
+                "market_value": 4500.0,
+                "unrealized_pl": 500.0,
+                "unrealized_pl_pct": 12.5,
+            }
+        ]
+    )
+
+    rows = {r["name"]: r for r in _compute_metrics(store)["strategies"]}
+    assert rows["crypto_volatility"]["open_positions"] == 1
+    assert rows["crypto_volatility"]["unrealized_pl"] == pytest.approx(500.0)
+    assert rows["crypto_volatility"]["closed_trades"] == 0
+    assert rows["crypto_volatility"]["last_trade_at"] == "2026-01-05T00:00:00+00:00"
     store.close()

@@ -25,7 +25,11 @@ change.
 - **Rich strategy family** — momentum, gap-fade, quote-imbalance, trend-
   following, mean-reversion, breakout, volatility, pairs, DCA, rebalancing, and
   a pluggable ML slot.
-- **Backtest engine** — replay daily bars through the momentum + ATR-stop logic.
+- **Backtest engine** — replay daily bars through momentum / crypto-momentum /
+  crypto-volatility logic with ATR stops.
+- **Self-improvement optimizer** — a backtest-driven, multi-threaded parameter
+  search that walks the trading parameters toward proven, *out-of-sample*
+  improvements while guarding against single-symbol over-fitting.
 - **Local web dashboard** — live equity curve, performance metrics, and
   start/stop/restart controls (optional).
 
@@ -154,7 +158,26 @@ web:
 
 Then run the supervisor and open <http://127.0.0.1:8787>. It shows the live
 equity curve, total return, annualised return, transaction count/last trade,
-broker + uptime, and provides **Restart** / **Stop** buttons.
+the **best & worst 10 closed trades of all time**, broker + uptime, and provides
+**Restart** / **Stop** buttons.
+
+Reading the cards:
+
+- **Current Equity** = **Cash** + **Positions Value** (the market value of open
+  holdings), so those three always reconcile.
+- **Total Return** is measured against the *first ever* equity snapshot, not the
+  visible slice of the chart. Hover the card to see the baseline.
+- **Uptime** counts the current trader process (`y d h m`); it resets to zero on
+  every restart. Hover for the supervisor's uptime and the restart count.
+- The equity chart has **7 / 14 / 30 days** and **All** buttons (the choice is
+  remembered per browser). The window only affects the graph — every headline
+  figure stays all-time. Behind it, `GET /api/metrics?days=N` limits the curve.
+- The **Strategy Performance** table at the bottom lists every configured
+  strategy with `active` / `disabled` status plus its buys, closed trades, win
+  rate, realized and unrealized P/L since the last **Reset**. Realized P/L is
+  credited to the strategy that *opened* the position, not to the exit that
+  closed it (`crypto_stop`, `crypto_take_profit`), so it is a fair basis for
+  deciding which algo to improve or switch off.
 
 > The dashboard binds to loopback only. Do **not** expose it publicly without an
 > authenticating reverse proxy in front.
@@ -164,11 +187,136 @@ broker + uptime, and provides **Restart** / **Stop** buttons.
 ## Backtesting
 
 ```powershell
-python -m trader.backtest --symbols AAPL,MSFT,NVDA --days 365
+# Equity momentum (default) — the window is selected in months
+python -m trader.backtest --symbols AAPL,MSFT,NVDA --months 12
+
+# Crypto strategies replay the same engine with their own ranking logic
+python -m trader.backtest --symbols BTC/USD,ETH/USD --strategy crypto_momentum --months 6
+python -m trader.backtest --symbols BTC/USD,ETH/USD --strategy crypto_volatility --months 3
+
+# --days is still accepted for an exact calendar-day window
+python -m trader.backtest --symbols AAPL,MSFT,NVDA --days 90
 ```
 
-Prints total return, number of trades, and win rate. The backtester reuses the
-exact indicator / ATR code paths used in live trading.
+`--months` and `--days` are mutually exclusive; with neither, the last
+**12 months** are replayed. The resolved window is printed before the run, and
+if it is too short for the strategy's warm-up (e.g. a 1-month window against a
+60-day momentum lookback) you get an explicit "expect no trades" warning instead
+of a silent flat result.
+
+Prints total return, number of trades, win rate, and max drawdown. The
+backtester reuses the exact indicator / ATR code paths used in live trading.
+`--strategy` selects which family's ranking logic is replayed (see
+`STRATEGY_RANKERS` in `trader/backtest.py`).
+
+### Where does the backtest data come from?
+
+From the **active broker adapter** — `Backtester.run()` calls
+`broker.get_bars(...)`, so with `broker.provider: alpaca` the bars are Alpaca
+Market Data, using the feed set in `alpaca.data_feed`. No separate data vendor
+is needed:
+
+| | Alpaca **Basic** (free) | Algo Trader Plus ($99/mo) |
+|---|---|---|
+| Historical range | since **2016** | since 2016 |
+| Recency limit | latest **15 minutes** withheld (SIP) | none |
+| Equity coverage | IEX only | all US exchanges |
+| Rate limit | 200 calls/min | 10,000 calls/min |
+| Crypto history | unrestricted | unrestricted |
+
+So the free plan does *not* cap you at 15 minutes of history — it withholds the
+*most recent* 15 minutes and gives you years of daily bars. Two consequences the
+adapter now handles for you (`_clamp_history_window` in
+`trader/brokers/alpaca.py`):
+
+- a `start` earlier than 2016 is clamped, with a warning, instead of silently
+  returning nothing;
+- on `data_feed: sip` the request `end` is pulled back behind the 15-minute
+  cutoff so a Basic-plan account gets data instead of a subscription error.
+  `iex` has no recency restriction and is left untouched.
+
+Symbols that come back with **zero** bars are now logged as a warning, and a
+subscription/403 rejection prints an actionable hint naming `alpaca.data_feed`.
+
+> Free-plan caveat: equity bars are IEX-only, so volumes are a fraction of the
+> consolidated tape and daily OHLC can differ slightly. Fine for relative
+> ranking and sanity checks; don't read the fills as tick-accurate. Crypto bars
+> have no such limitation. (Paid vendors such as ThetaData — $40–$160/mo,
+> options-focused — have no free tier and are not required here.)
+
+---
+
+## Self-improvement / parameter optimizer
+
+The optimizer repeatedly backtests a strategy against a large, cached universe
+of historical bars, scores each parameter set with an overfit-resistant
+composite metric, and nudges the parameters toward the changes that improve
+results — then periodically pushes *further* in the directions that have been
+helping. Runs can be long; that is expected.
+
+```powershell
+# 1. Build (or refresh) the on-disk bar cache once. Equities are volume-ranked,
+#    so --max-symbols keeps the MOST LIQUID names, not an arbitrary first N.
+python -m trader.optimize --refresh-cache --max-symbols 500 --cache-only
+
+# 2. Optimise equity momentum for 40 rounds across all CPU cores.
+python -m trader.optimize --strategy momentum --rounds 40
+
+# 3. Optimise crypto momentum, then apply the winner to config.yaml.
+python -m trader.optimize --strategy crypto_momentum --rounds 40 --apply
+```
+
+### How it resists over-fitting
+
+The user's key requirement is that the bot must **not** tune itself to replay a
+single symbol's curve. Three mechanisms enforce this:
+
+- **Portfolio, not per-symbol** — every candidate is scored across *all* cached
+  symbols at once, never one symbol in isolation.
+- **Walk-forward + k-fold splits** — history is chopped into consecutive time
+  windows and symbols into folds; a parameter set must work across different
+  periods and different symbol groups. A leading slice trains and a trailing
+  slice validates, so the reported **validation** score is out-of-sample.
+- **Variance penalties** — the composite objective is
+  `mean_return − w·drawdown − w·stdev(per-symbol returns) − w·stdev(per-fold
+  scores)`. Profit concentrated in one symbol (high per-symbol spread) or luck
+  on one window (high per-fold spread) is penalised, so only a *general* edge
+  scores well. Weights are tunable via `--w-drawdown`, `--w-symbol-var`,
+  `--w-fold-var`.
+
+### Compute & parallelism
+
+Candidate and fold evaluations are spread across CPU cores with a process pool
+(`--workers 0` = all cores, `1` = serial). The bar download is cached to disk
+(`data/backtest_cache/bars.pkl`) so thousands of evaluations reuse one fetch.
+
+### Tunable parameters
+
+| Strategy            | Parameters walked                                                                 |
+| ------------------- | --------------------------------------------------------------------------------- |
+| `momentum`          | `fast_lookback`, `slow_lookback`, `top_n` + risk knobs                            |
+| `crypto_momentum`   | `fast_ma`, `slow_ma`, `adx_min`, `top_n` + risk knobs                             |
+| `crypto_volatility` | `lookback`, `low_vol_pct`, `high_vol_pct`, `top_n` + risk knobs                   |
+
+Shared risk knobs: `atr_stop_multiplier`, `max_hold_days`, `max_risk_per_trade`,
+`max_positions` (see `DEFAULT_PARAM_SPECS` in `trader/optimize/optimizer.py`).
+
+### Outputs (under `--out-dir`, default `data/optimize`)
+
+| File                                | Contents                                                        |
+| ----------------------------------- | --------------------------------------------------------------- |
+| `optimize_state_<strategy>.json`    | Resumable state + full round history (use `--resume`).          |
+| `optimize_report_<strategy>.csv`    | One row per round: score, accepted?, which params changed.      |
+| `config.optimized.yaml`             | The base config with the winning parameters merged in.          |
+
+By default nothing is overwritten — adopt the result by copying
+`config.optimized.yaml` over `config.yaml`, or re-run with **`--apply`** to write
+it in place (the previous `config.yaml` is backed up to `config.yaml.bak`).
+Secrets are never written to these files.
+
+> The `--max-symbols` cap uses **volume ranking** everywhere (live universe
+> building *and* the optimizer cache): the most liquid symbols are kept rather
+> than whatever the broker happened to list first.
 
 ---
 
@@ -280,9 +428,10 @@ trader/
 ├── risk/           # Position sizing, drawdown breaker, ATR stops
 ├── execution/      # Order manager, portfolio, SQLite state store
 ├── web/            # Optional FastAPI dashboard
+├── optimize/       # Backtest-driven self-improvement (cache, scoring, search)
 ├── main.py         # Trader orchestrator + APScheduler jobs
 ├── supervisor.py   # Watchdog + dashboard host
-└── backtest.py     # Daily backtest engine
+└── backtest.py     # Daily backtest engine (momentum / crypto replay)
 ```
 
 Nothing above the broker layer imports a vendor SDK — adapters translate native

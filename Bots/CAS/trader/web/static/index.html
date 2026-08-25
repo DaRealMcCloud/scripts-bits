@@ -44,6 +44,16 @@
     th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--border); }
     th { color: var(--muted); font-weight: 500; }
     .pill { padding: 2px 8px; border-radius: 10px; font-size: 11px; background: #21262d; }
+    .top-trades { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 20px; }
+    .top-trades > div { overflow-x: auto; }
+    .range-bar { display: flex; align-items: center; justify-content: space-between; margin-bottom: 10px; }
+    .ranges button {
+      background: var(--bg); color: var(--muted); border: 1px solid var(--border);
+      border-radius: 6px; padding: 4px 12px; margin-left: 6px; cursor: pointer; font-size: 12px;
+    }
+    .ranges button:hover { border-color: var(--accent); color: var(--text); }
+    .ranges button.active { border-color: var(--accent); color: var(--accent); background: var(--panel); }
+    tr.idle td { color: var(--muted); }
   </style>
 </head>
 <body>
@@ -59,21 +69,31 @@
 
   <main>
     <div class="cards">
-      <div class="card"><div class="label">Current Equity</div><div class="value" id="equity">–</div></div>
+      <div class="card" title="Total account value = cash + market value of open positions."><div class="label">Current Equity</div><div class="value" id="equity">–</div></div>
       <div class="card"><div class="label">Cash</div><div class="value" id="cash">–</div></div>
       <div class="card"><div class="label">Unrealized P&amp;L</div><div class="value" id="upl">–</div></div>
-      <div class="card"><div class="label">Portfolio Value</div><div class="value" id="pv">–</div></div>
-      <div class="card"><div class="label">Total Return</div><div class="value" id="ret">–</div></div>
+      <div class="card" id="pvCard" title="Market value of the open positions only. Current equity = cash + positions value."><div class="label">Positions Value</div><div class="value" id="pv">–</div></div>
+      <div class="card" id="retCard" title="Change in equity since the first recorded snapshot."><div class="label">Total Return</div><div class="value" id="ret">–</div></div>
       <div class="card" title="Annualised (CAGR). Shown once the track record is at least two weeks long — annualising a shorter sample produces misleading numbers."><div class="label">Return p.a.</div><div class="value" id="retpa">–</div></div>
       <div class="card"><div class="label">Transactions</div><div class="value" id="txn">–</div></div>
       <div class="card"><div class="label">Realized P&amp;L</div><div class="value" id="realized">–</div></div>
       <div class="card"><div class="label">Win Rate</div><div class="value" id="winrate">–</div></div>
       <div class="card"><div class="label">Broker</div><div class="value" id="broker">–</div></div>
-      <div class="card"><div class="label">Uptime</div><div class="value" id="uptime">–</div></div>
+      <div class="card" id="uptimeCard" title="How long the current trader process has been running."><div class="label">Uptime</div><div class="value" id="uptime">–</div></div>
     </div>
 
     <div class="chart-wrap">
+      <div class="range-bar">
+        <div class="label">Equity History</div>
+        <div class="ranges">
+          <button data-days="7">7 days</button>
+          <button data-days="14">14 days</button>
+          <button data-days="30">30 days</button>
+          <button data-days="">All</button>
+        </div>
+      </div>
       <canvas id="equityChart" height="110"></canvas>
+      <div class="meta" id="chartNote"></div>
     </div>
 
     <div class="chart-wrap">
@@ -89,11 +109,48 @@
       </div>
     </div>
 
+    <div class="chart-wrap">
+      <div class="label">Best &amp; Worst Closed Trades (all time)</div>
+      <div class="top-trades">
+        <div>
+          <div class="meta">Top 10 winners</div>
+          <table id="winnersTable">
+            <thead><tr><th>Time</th><th>Symbol</th><th>Qty</th><th>Exit</th><th>Strategy</th><th>P/L</th></tr></thead>
+            <tbody><tr><td class="meta" colspan="6">No closed trades yet.</td></tr></tbody>
+          </table>
+        </div>
+        <div>
+          <div class="meta">Top 10 losers</div>
+          <table id="losersTable">
+            <thead><tr><th>Time</th><th>Symbol</th><th>Qty</th><th>Exit</th><th>Strategy</th><th>P/L</th></tr></thead>
+            <tbody><tr><td class="meta" colspan="6">No closed trades yet.</td></tr></tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+
+    <div class="chart-wrap">
+      <div class="label">Strategy Performance (since last reset)</div>
+      <div class="meta">Realized P/L is credited to the strategy that opened the position, not to the exit that closed it.</div>
+      <div style="overflow-x: auto;">
+        <table id="strategyTable">
+          <thead>
+            <tr><th>Strategy</th><th>Status</th><th>Buys</th><th>Closed</th><th>Win rate</th>
+                <th>Realized P/L</th><th>Open</th><th>Unrealized</th><th>Last trade</th></tr>
+          </thead>
+          <tbody><tr><td class="meta" colspan="9">No strategy activity yet.</td></tr></tbody>
+        </table>
+      </div>
+    </div>
+
     <div class="meta" id="footer">–</div>
   </main>
 
   <script>
     let chart;
+    // "" = whole history; anything else is a day count sent to /api/metrics.
+    let chartRange = localStorage.getItem("chartRange");
+    if (chartRange === null) chartRange = "30";
 
     function fmtMoney(v) {
       if (v == null) return "–";
@@ -114,9 +171,18 @@
       if (v != null && v !== 0) el.classList.add(v > 0 ? "good" : "bad");
     }
     function fmtUptime(s) {
-      if (!s) return "–";
-      const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60);
-      return h > 0 ? `${h}h ${m}m` : `${m}m`;
+      if (s == null || s < 0) return "–";
+      const total = Math.floor(s);
+      const y = Math.floor(total / 31536000);          // 365-day years
+      const d = Math.floor((total % 31536000) / 86400);
+      const h = Math.floor((total % 86400) / 3600);
+      const m = Math.floor((total % 3600) / 60);
+      const parts = [];
+      if (y) parts.push(y + "y");
+      if (y || d) parts.push(d + "d");
+      if (y || d || h) parts.push(h + "h");
+      parts.push(m + "m");
+      return parts.join(" ");
     }
 
     function esc(v) {
@@ -129,6 +195,12 @@
       if (v == null) return "–";
       const n = Number(v);
       return Number.isInteger(n) ? String(n) : n.toLocaleString(undefined, { maximumFractionDigits: 6 });
+    }
+
+    // ISO timestamps carry microseconds + offset; minutes are enough on screen.
+    function fmtTime(ts) {
+      if (!ts) return "–";
+      return String(ts).replace("T", " ").slice(0, 16);
     }
 
     function renderTxns(txns) {
@@ -185,8 +257,64 @@
       }).join("");
     }
 
-    async function control(action) {
-      if (!confirm(`Really ${action} the trader?`)) return;
+    function renderTopTrades(id, trades, emptyText) {
+      const tbody = document.querySelector(`#${id} tbody`);
+      if (!trades || trades.length === 0) {
+        tbody.innerHTML = `<tr><td class="meta" colspan="6">${emptyText}</td></tr>`;
+        return;
+      }
+      tbody.innerHTML = trades.map(t => {
+        const pl = t.realized_pl;
+        const cls = pl >= 0 ? "good" : "bad";
+        const sign = pl > 0 ? "+" : "";
+        const pct = (t.realized_pl_pct != null)
+          ? ` (${sign}${t.realized_pl_pct.toFixed(2)}%)` : "";
+        const basis = (t.avg_cost != null) ? `entry ≈ ${fmtMoney(t.avg_cost)}` : "";
+        return `<tr>
+          <td class="meta" title="${esc(t.created_at)}">${esc(fmtTime(t.created_at))}</td>
+          <td>${esc(t.symbol)}</td>
+          <td>${fmtQty(t.qty)}</td>
+          <td title="${esc(basis)}">${t.price != null ? fmtMoney(t.price) : "–"}</td>
+          <td>${esc(t.strategy)}</td>
+          <td><span class="${cls}">${sign}${fmtMoney(pl)}${pct}</span></td>
+        </tr>`;
+      }).join("");
+    }
+
+    function renderStrategies(rows) {
+      const tbody = document.querySelector("#strategyTable tbody");
+      if (!rows || rows.length === 0) {
+        tbody.innerHTML = `<tr><td class="meta" colspan="9">No strategy activity yet.</td></tr>`;
+        return;
+      }
+      tbody.innerHTML = rows.map(r => {
+        let status = `<span class="pill" title="Not a configured strategy — e.g. a stop/take-profit exit or a backfilled order">system</span>`;
+        if (r.enabled === true) status = `<span class="pill good">active</span>`;
+        else if (r.enabled === false) status = `<span class="pill">disabled</span>`;
+        const pl = r.realized_pl;
+        const plCls = pl > 0 ? "good" : (pl < 0 ? "bad" : "meta");
+        const plPct = (r.realized_pl_pct != null)
+          ? ` (${r.realized_pl_pct > 0 ? "+" : ""}${r.realized_pl_pct.toFixed(2)}%)` : "";
+        const upl = r.unrealized_pl;
+        const uplCls = upl > 0 ? "good" : (upl < 0 ? "bad" : "meta");
+        const winRate = (r.win_rate_pct != null)
+          ? `${r.win_rate_pct.toFixed(0)}% (${r.wins}W / ${r.losses}L)` : "–";
+        const idle = (r.orders === 0 && r.closed_trades === 0) ? ' class="idle"' : "";
+        return `<tr${idle}>
+          <td>${esc(r.name)}</td>
+          <td>${status}</td>
+          <td>${r.orders}</td>
+          <td>${r.closed_trades}</td>
+          <td>${winRate}</td>
+          <td><span class="${plCls}">${pl > 0 ? "+" : ""}${fmtMoney(pl)}${plPct}</span></td>
+          <td>${r.open_positions}</td>
+          <td><span class="${uplCls}">${upl > 0 ? "+" : ""}${fmtMoney(upl)}</span></td>
+          <td class="meta" title="${esc(r.last_trade_at || "")}">${r.last_trade_at ? esc(fmtTime(r.last_trade_at)) : "–"}</td>
+        </tr>`;
+      }).join("");
+    }
+
+    async function control(action) {      if (!confirm(`Really ${action} the trader?`)) return;
       try {
         const r = await fetch(`/api/${action}`, { method: "POST" });
         const j = await r.json();
@@ -207,6 +335,9 @@
       // Empty the transactions table.
       document.querySelector("#txnTable tbody").innerHTML =
         `<tr><td class="meta" colspan="8">No transactions yet.</td></tr>`;
+      renderTopTrades("winnersTable", [], "No closed trades yet.");
+      renderTopTrades("losersTable", [], "No closed trades yet.");
+      renderStrategies([]);
       // Blank the chart.
       renderChart([]);
     }
@@ -235,19 +366,31 @@
           (s.competing_session ? ' <span class="pill" style="color:var(--warn)">competing session</span>' : "");
         document.getElementById("broker").textContent = s.broker_provider || "–";
         document.getElementById("uptime").textContent = fmtUptime(s.uptime_seconds);
+        // The card counts the CURRENT trader process, so a restart sends it back
+        // to zero — spell that out rather than leaving it looking like a bug.
+        const superUp = (s.supervisor_uptime_seconds != null)
+          ? ` Supervisor up ${fmtUptime(s.supervisor_uptime_seconds)}.` : "";
+        const restarts = (s.restarts != null) ? ` Restarts: ${s.restarts}.` : "";
+        document.getElementById("uptimeCard").title =
+          `Uptime of the current trader process; it resets to 0 on every restart.${superUp}${restarts}`;
       } catch (e) { /* keep last known */ }
     }
 
     async function refreshMetrics() {
       try {
-        const m = await (await fetch("/api/metrics")).json();
+        const q = chartRange ? `?days=${encodeURIComponent(chartRange)}` : "";
+        const m = await (await fetch(`/api/metrics${q}`)).json();
         document.getElementById("equity").textContent = fmtMoney(m.current_equity);
         document.getElementById("cash").textContent = fmtMoney(m.current_cash);
         setMoneySign(document.getElementById("upl"), m.current_unrealized_pl);
-        document.getElementById("pv").textContent = fmtMoney(m.portfolio_value);
+        document.getElementById("pv").textContent = fmtMoney(m.positions_value);
         setPct(document.getElementById("ret"), m.total_return_pct);
         setPct(document.getElementById("retpa"), m.return_pa_pct);
         document.getElementById("txn").textContent = m.num_transactions ?? "–";
+        if (m.start_equity != null) {
+          document.getElementById("retCard").title =
+            `Equity moved from ${fmtMoney(m.start_equity)} (first snapshot ${m.start_at}) to ${fmtMoney(m.current_equity)}.`;
+        }
 
         // Realized P/L: total dollars with overall % of cost basis.
         const realizedEl = document.getElementById("realized");
@@ -276,9 +419,16 @@
         document.getElementById("footer").textContent = "Updated " + (m.generated_at || "") + asOf;
 
         renderTxns(m.recent_transactions || []);
+        renderTopTrades("winnersTable", m.top_winners || [], "No winning trades yet.");
+        renderTopTrades("losersTable", m.top_losers || [], "No losing trades yet.");
+        renderStrategies(m.strategies || []);
 
         const pts = (m.equity_series || []).map(p => ({ x: p.t, y: p.v, cash: p.cash }));
         renderChart(pts);
+        const span = chartRange ? `last ${chartRange} days` : "all time";
+        document.getElementById("chartNote").textContent = pts.length
+          ? `Showing ${span} — ${pts.length} point(s), ${fmtTime(pts[0].x)} → ${fmtTime(pts[pts.length - 1].x)}`
+          : `No equity snapshots in the ${span}.`;
       } catch (e) { /* keep last known */ }
     }
 
@@ -291,7 +441,7 @@
           type: "line",
           data: { labels, datasets: [
             {
-              label: "Portfolio Value", data,
+              label: "Equity", data,
               borderColor: "#58a6ff", backgroundColor: "rgba(88,166,255,.12)",
               fill: true, tension: .25, pointRadius: 0, borderWidth: 2,
             },
@@ -306,7 +456,13 @@
             responsive: true, animation: false,
             plugins: { legend: { labels: { color: "#c9d1d9" } } },
             scales: {
-              x: { ticks: { color: "#8b949e", maxTicksLimit: 8 }, grid: { color: "#21262d" } },
+              x: {
+                ticks: {
+                  color: "#8b949e", maxTicksLimit: 8,
+                  callback(value) { return fmtTime(this.getLabelForValue(value)); },
+                },
+                grid: { color: "#21262d" },
+              },
               y: { ticks: { color: "#8b949e" }, grid: { color: "#21262d" } },
             },
           },
@@ -320,6 +476,19 @@
     }
 
     function tick() { refreshStatus(); refreshMetrics(); }
+
+    function highlightRange() {
+      document.querySelectorAll(".ranges button").forEach(b =>
+        b.classList.toggle("active", b.dataset.days === chartRange));
+    }
+    document.querySelectorAll(".ranges button").forEach(b => b.addEventListener("click", () => {
+      chartRange = b.dataset.days;
+      localStorage.setItem("chartRange", chartRange);
+      highlightRange();
+      refreshMetrics();
+    }));
+    highlightRange();
+
     tick();
     setInterval(tick, 5000);
   </script>

@@ -18,7 +18,7 @@ from __future__ import annotations
 import json
 import logging
 import math
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -111,7 +111,12 @@ def _annotate_realized_pl(
                 pos["qty"] += qty
                 pos["cost"] += qty * price
                 # Track this buy as an open lot for FIFO matching against sells.
-                lot = {"order": o, "buy_price": price, "open_qty": qty}
+                lot = {
+                    "order": o,
+                    "buy_price": price,
+                    "open_qty": qty,
+                    "strategy": o.get("strategy") or "unknown",
+                }
                 open_lots.setdefault(symbol, []).append(lot)
         elif side == "sell":
             avg_cost = (pos["cost"] / pos["qty"]) if pos["qty"] > 0 else None
@@ -126,15 +131,36 @@ def _annotate_realized_pl(
                 pos["cost"] -= avg_cost * sell_qty
                 pos["qty"] -= sell_qty
                 # Consume open buy lots FIFO so remaining lots reflect what's held.
+                # A sell's own `strategy` is the exit reason (crypto_stop, …), so
+                # the P/L is credited to the strategy that OPENED each lot.
+                pl_by_strategy: dict[str, float] = {}
+                cost_by_strategy: dict[str, float] = {}
                 remaining = sell_qty
                 lots = open_lots.get(symbol, [])
                 while remaining > 0 and lots:
                     lot = lots[0]
                     take = min(lot["open_qty"], remaining)
+                    owner = lot["strategy"]
+                    pl_by_strategy[owner] = pl_by_strategy.get(owner, 0.0) + (
+                        price - avg_cost
+                    ) * take
+                    cost_by_strategy[owner] = (
+                        cost_by_strategy.get(owner, 0.0) + avg_cost * take
+                    )
                     lot["open_qty"] -= take
                     remaining -= take
                     if lot["open_qty"] <= 1e-12:
                         lots.pop(0)
+                if remaining > 1e-12:
+                    # Sold more than the tracked lots cover (buy never recorded).
+                    pl_by_strategy["unattributed"] = pl_by_strategy.get(
+                        "unattributed", 0.0
+                    ) + (price - avg_cost) * remaining
+                    cost_by_strategy["unattributed"] = (
+                        cost_by_strategy.get("unattributed", 0.0) + avg_cost * remaining
+                    )
+                o["pl_by_strategy"] = pl_by_strategy
+                o["cost_by_strategy"] = cost_by_strategy
             else:
                 o["realized_pl"] = None
         else:
@@ -163,24 +189,169 @@ def _annotate_realized_pl(
 
 
 
-def _compute_metrics(store: StateStore) -> dict[str, Any]:
-    series = store.equity_series(limit=5000)
-    orders = store.all_orders(limit=1000)
+def _closed_trade_row(order: dict[str, Any]) -> dict[str, Any]:
+    """Trim an annotated SELL order down to what the winners/losers table shows."""
+    return {
+        "created_at": order.get("created_at"),
+        "symbol": order.get("symbol"),
+        "qty": order.get("qty"),
+        "price": order.get("limit_price"),
+        "avg_cost": order.get("avg_cost"),
+        "strategy": order.get("strategy"),
+        "realized_pl": order.get("realized_pl"),
+        "realized_pl_pct": order.get("realized_pl_pct"),
+    }
+
+
+# Strategy config keys, in the same order ``Trader._build_strategies`` uses. The
+# runtime strategy name (what lands on an order) equals the key, prefixed with
+# "crypto_" for the crypto family.
+_EQUITY_STRATEGY_KEYS = (
+    "momentum",
+    "gap_fade",
+    "trend_following",
+    "mean_reversion",
+    "breakout",
+    "volatility",
+    "pairs_trading",
+    "dca",
+    "rebalance",
+    "ml",
+)
+_CRYPTO_STRATEGY_KEYS = (
+    "momentum",
+    "mean_reversion",
+    "breakout",
+    "dca",
+    "volatility",
+)
+
+
+def _configured_strategies(cfg: "Config | None") -> dict[str, dict[str, Any]]:
+    """Map runtime strategy name → {enabled, kind} from the loaded config."""
+    if cfg is None:
+        return {}
+    out: dict[str, dict[str, Any]] = {}
+    s = cfg.strategies
+    for key in _EQUITY_STRATEGY_KEYS:
+        section = getattr(s, key, None)
+        if section is not None:
+            out[key] = {"enabled": bool(getattr(section, "enabled", False)), "kind": "equity"}
+    crypto = getattr(s, "crypto", None)
+    if crypto is not None:
+        crypto_on = bool(getattr(crypto, "enabled", False))
+        for key in _CRYPTO_STRATEGY_KEYS:
+            section = getattr(crypto, key, None)
+            if section is not None:
+                out[f"crypto_{key}"] = {
+                    # A crypto strategy only runs when the crypto loop is on too.
+                    "enabled": crypto_on and bool(getattr(section, "enabled", False)),
+                    "kind": "crypto",
+                }
+    return out
+
+
+def _strategy_performance(
+    orders: list[dict[str, Any]], cfg: "Config | None" = None
+) -> list[dict[str, Any]]:
+    """Per-strategy results over the recorded orders (i.e. since the last reset).
+
+    Realized P/L is credited to the strategy that OPENED the position (see
+    ``_annotate_realized_pl``), not to the exit tag on the sell order.
+    Strategies that are enabled but have not traded yet are listed with zeros.
+    """
+    configured = _configured_strategies(cfg)
+    stats: dict[str, dict[str, Any]] = {}
+
+    def row(name: str) -> dict[str, Any]:
+        return stats.setdefault(
+            name,
+            {
+                "name": name,
+                "enabled": configured.get(name, {}).get("enabled"),
+                "kind": configured.get(name, {}).get("kind", "other"),
+                "orders": 0,
+                "closed_trades": 0,
+                "wins": 0,
+                "losses": 0,
+                "realized_pl": 0.0,
+                "realized_cost": 0.0,
+                "open_positions": 0,
+                "unrealized_pl": 0.0,
+                "last_trade_at": None,
+            },
+        )
+
+    for name in configured:
+        row(name)
+
+    for o in orders:
+        created_at = o.get("created_at")
+        if (o.get("side") or "").lower() == "buy":
+            r = row(o.get("strategy") or "unknown")
+            r["orders"] += 1
+            if o.get("unrealized_pl") is not None:
+                r["open_positions"] += 1
+                r["unrealized_pl"] += float(o["unrealized_pl"])
+            if created_at and (r["last_trade_at"] is None or created_at > r["last_trade_at"]):
+                r["last_trade_at"] = created_at
+        for name, pl in (o.get("pl_by_strategy") or {}).items():
+            r = row(name)
+            r["closed_trades"] += 1
+            r["realized_pl"] += pl
+            r["realized_cost"] += (o.get("cost_by_strategy") or {}).get(name, 0.0)
+            if pl > 0:
+                r["wins"] += 1
+            elif pl < 0:
+                r["losses"] += 1
+            if created_at and (r["last_trade_at"] is None or created_at > r["last_trade_at"]):
+                r["last_trade_at"] = created_at
+
+    rows = []
+    for r in stats.values():
+        decided = r["wins"] + r["losses"]
+        r["win_rate_pct"] = (r["wins"] / decided * 100.0) if decided else None
+        r["realized_pl_pct"] = (
+            (r["realized_pl"] / r["realized_cost"]) * 100.0
+            if r["realized_cost"] > 0
+            else None
+        )
+        r.pop("realized_cost")
+        rows.append(r)
+    # Best performers first; untraded strategies sink to the bottom.
+    rows.sort(key=lambda r: (r["closed_trades"] > 0 or r["orders"] > 0, r["realized_pl"]), reverse=True)
+    return rows
+
+
+def _compute_metrics(
+    store: StateStore,
+    chart_days: int | None = None,
+    cfg: "Config | None" = None,
+) -> dict[str, Any]:
+    # The chart window only limits the curve — headline returns stay all-time.
+    since = (
+        (datetime.now(timezone.utc) - timedelta(days=chart_days)).isoformat()
+        if chart_days
+        else None
+    )
+    series = store.equity_curve(max_points=1000, since=since)
+    orders = store.all_orders(limit=10000)
 
     points = [
         {"t": row["ts"], "v": row["equity"], "cash": row.get("cash")}
         for row in series
     ]
+    first = store.first_equity()
+    latest = store.latest_equity()
     total_return_pct: float | None = None
     return_pa_pct: float | None = None
-    if len(series) >= 2:
-        start_v = series[0]["equity"]
-        end_v = series[-1]["equity"]
-        if start_v > 0:
-            total_return_pct = (end_v / start_v - 1.0) * 100.0
+    if first and latest and first["equity"] > 0:
+        start_v = first["equity"]
+        end_v = latest["equity"]
+        total_return_pct = (end_v / start_v - 1.0) * 100.0
         try:
-            t0 = datetime.fromisoformat(series[0]["ts"])
-            t1 = datetime.fromisoformat(series[-1]["ts"])
+            t0 = datetime.fromisoformat(first["ts"])
+            t1 = datetime.fromisoformat(latest["ts"])
             days = max((t1 - t0).total_seconds() / 86400.0, 0.0)
             return_pa_pct = _annualised_return(start_v, end_v, days)
         except Exception:
@@ -191,6 +362,14 @@ def _compute_metrics(store: StateStore) -> dict[str, Any]:
     positions = store.latest_positions()
     _annotate_realized_pl(orders, positions)
     recent_transactions = orders[:100]
+
+    # Best/worst closed round-trips over the whole recorded history.
+    closed_trades = [o for o in orders if o.get("realized_pl") is not None]
+    by_pl = sorted(closed_trades, key=lambda o: o["realized_pl"], reverse=True)
+    top_winners = [_closed_trade_row(o) for o in by_pl if o["realized_pl"] > 0][:10]
+    top_losers = [
+        _closed_trade_row(o) for o in reversed(by_pl) if o["realized_pl"] < 0
+    ][:10]
 
     # Aggregate win/loss across every closed (sell) trade with known basis.
     realized_total = 0.0
@@ -211,31 +390,50 @@ def _compute_metrics(store: StateStore) -> dict[str, Any]:
             wins += 1
         elif pl < 0:
             losses += 1
-    closed_trades = wins + losses
+    closed_count = wins + losses
     realized_pl_pct = (
         (realized_total / realized_cost) * 100.0 if realized_cost > 0 else None
     )
-    win_rate_pct = (wins / closed_trades * 100.0) if closed_trades > 0 else None
+    win_rate_pct = (wins / closed_count * 100.0) if closed_count > 0 else None
 
     last_txn = orders[0] if orders else None
 
-    latest = store.latest_equity()
+    current_equity = (latest or {}).get("equity")
+    current_cash = (latest or {}).get("cash")
+    # Equity = cash + market value of holdings, so holdings are what the
+    # "positions value" card shows. Derived from the same snapshot row as the
+    # other two cards so they always reconcile; the per-symbol snapshot (which
+    # can lag by a cycle) is only a fallback.
+    if current_equity is not None and current_cash is not None:
+        positions_value = current_equity - current_cash
+    elif positions:
+        positions_value = sum(
+            float(p.get("market_value") or 0.0) for p in positions.values()
+        )
+    else:
+        positions_value = None
 
     return {
-        "portfolio_value": series[-1]["equity"] if series else None,
-        "current_equity": (latest or {}).get("equity"),
-        "current_cash": (latest or {}).get("cash"),
+        "positions_value": positions_value,
+        "current_equity": current_equity,
+        "current_cash": current_cash,
         "current_unrealized_pl": (latest or {}).get("unrealized_pl"),
         "equity_as_of": (latest or {}).get("ts"),
+        "start_equity": (first or {}).get("equity"),
+        "start_at": (first or {}).get("ts"),
         "equity_series": points,
+        "chart_days": chart_days,
         "total_return_pct": total_return_pct,
         "return_pa_pct": return_pa_pct,
         "num_transactions": len(orders),
-        "realized_pl_total": realized_total if closed_trades > 0 else None,
+        "realized_pl_total": realized_total if closed_count > 0 else None,
         "realized_pl_pct": realized_pl_pct,
         "wins": wins,
         "losses": losses,
         "win_rate_pct": win_rate_pct,
+        "top_winners": top_winners,
+        "top_losers": top_losers,
+        "strategies": _strategy_performance(orders, cfg),
         "last_transaction": last_txn,
         "recent_transactions": recent_transactions,
         "generated_at": datetime.now(timezone.utc).isoformat(),
@@ -260,8 +458,10 @@ def create_app(cfg: "Config", supervisor: "Supervisor | None" = None):
         return JSONResponse(status)
 
     @app.get("/api/metrics")
-    def api_metrics() -> JSONResponse:
-        return JSONResponse(_compute_metrics(store))
+    def api_metrics(days: int | None = None) -> JSONResponse:
+        if days is not None:
+            days = max(1, min(days, 3650))
+        return JSONResponse(_compute_metrics(store, chart_days=days, cfg=cfg))
 
     @app.post("/api/restart")
     def api_restart() -> JSONResponse:

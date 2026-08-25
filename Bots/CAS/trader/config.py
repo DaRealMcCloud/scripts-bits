@@ -462,3 +462,47 @@ def load_config(path: str | Path | None = None) -> Config:
         )
 
     return cfg
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Serialization (write a Config back to a dict / YAML)
+# ─────────────────────────────────────────────────────────────────────────────
+# Secrets are never written to disk. These keys are stripped from any serialized
+# output so an optimizer / config dump can be committed or shared safely.
+_SECRET_PATHS: frozenset[tuple[str, str]] = frozenset(
+    {
+        ("alpaca", "api_key"),
+        ("alpaca", "secret_key"),
+    }
+)
+
+
+def config_to_dict(cfg: Config, *, redact_secrets: bool = True) -> dict:
+    """Convert a :class:`Config` (nested dataclasses) into a plain dict.
+
+    Suitable for ``yaml.safe_dump``. When ``redact_secrets`` is True (default)
+    the Alpaca API/secret keys are omitted so the result can be written to a
+    file safely.
+    """
+    from dataclasses import asdict
+
+    data = asdict(cfg)
+    if redact_secrets:
+        for section, key in _SECRET_PATHS:
+            if section in data and isinstance(data[section], dict):
+                data[section].pop(key, None)
+    return data
+
+
+def dump_config(cfg: Config, path: str | Path, *, redact_secrets: bool = True) -> None:
+    """Write a :class:`Config` to a YAML file.
+
+    Secrets are redacted by default (see :func:`config_to_dict`). Parent
+    directories are created as needed.
+    """
+    p = Path(path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    data = config_to_dict(cfg, redact_secrets=redact_secrets)
+    with p.open("w", encoding="utf-8") as fh:
+        yaml.safe_dump(data, fh, sort_keys=False, default_flow_style=False)
+    logger.info("Wrote config to %s", p)

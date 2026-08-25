@@ -287,3 +287,131 @@ def test_subscribe_quotes_all_crypto_subscribes_nothing():
 
     # Nothing valid to stream → the stock stream is never touched.
     assert stream.subscribed == []
+
+
+# ── Historical bar window clamping ────────────────────────────────────────────
+# Alpaca history starts in 2016, and the free Basic plan withholds only the
+# latest 15 minutes of SIP data (IEX has no recency restriction at all).
+
+
+def test_clamp_history_promotes_naive_datetimes_to_utc():
+    from datetime import datetime, timezone
+
+    from trader.brokers.alpaca import _clamp_history_window
+
+    start, end = _clamp_history_window(
+        datetime(2024, 1, 1), datetime(2024, 6, 1), now=datetime(2024, 6, 2)
+    )
+    assert start.tzinfo is timezone.utc
+    assert end.tzinfo is timezone.utc
+
+
+def test_clamp_history_start_limited_to_2016():
+    from datetime import datetime, timezone
+
+    from trader.brokers.alpaca import _ALPACA_HISTORY_START, _clamp_history_window
+
+    start, _ = _clamp_history_window(
+        datetime(2005, 3, 7, tzinfo=timezone.utc),
+        None,
+        now=datetime(2024, 6, 2, tzinfo=timezone.utc),
+    )
+    assert start == _ALPACA_HISTORY_START
+
+
+def test_clamp_history_sip_end_pulled_behind_free_tier_cutoff():
+    from datetime import datetime, timezone
+
+    from trader.brokers.alpaca import _FREE_TIER_DELAY, _clamp_history_window
+
+    now = datetime(2024, 6, 2, 15, 0, tzinfo=timezone.utc)
+    _, end = _clamp_history_window(
+        datetime(2024, 1, 1, tzinfo=timezone.utc), None, feed="sip", now=now
+    )
+    assert end == now - _FREE_TIER_DELAY
+
+
+def test_clamp_history_iex_end_is_not_delayed():
+    from datetime import datetime, timezone
+
+    from trader.brokers.alpaca import _clamp_history_window
+
+    now = datetime(2024, 6, 2, 15, 0, tzinfo=timezone.utc)
+    _, end = _clamp_history_window(
+        datetime(2024, 1, 1, tzinfo=timezone.utc), None, feed="iex", now=now
+    )
+    assert end == now
+
+
+def test_clamp_history_past_end_is_untouched():
+    from datetime import datetime, timezone
+
+    from trader.brokers.alpaca import _clamp_history_window
+
+    requested_end = datetime(2024, 5, 1, tzinfo=timezone.utc)
+    _, end = _clamp_history_window(
+        datetime(2024, 1, 1, tzinfo=timezone.utc),
+        requested_end,
+        feed="sip",
+        now=datetime(2024, 6, 2, tzinfo=timezone.utc),
+    )
+    assert end == requested_end
+
+
+def test_feed_name_accepts_string_and_enum():
+    from trader.brokers.alpaca import _feed_name
+
+    class _Feed:
+        value = "SIP"
+
+    assert _feed_name("IEX") == "iex"
+    assert _feed_name(_Feed()) == "sip"
+
+
+class _RecordingBars:
+    """Stands in for the Alpaca historical data clients."""
+
+    def __init__(self):
+        self.requests: list = []
+
+    def _capture(self, req):
+        import pandas as pd
+
+        self.requests.append(req)
+
+        class _Resp:
+            df = pd.DataFrame()
+
+        return _Resp()
+
+    get_stock_bars = _capture
+    get_crypto_bars = _capture
+
+
+def test_get_bars_sends_clamped_window_and_warns_on_missing(caplog):
+    from datetime import datetime, timezone
+
+    from trader.brokers.alpaca import _FREE_TIER_DELAY
+    from trader.brokers.types import TimeFrame
+
+    broker = _make_alpaca_broker(_RecordingTrading())
+    broker._feed = "sip"
+    stock = _RecordingBars()
+    broker.stock_data = stock
+
+    with caplog.at_level("WARNING"):
+        result = broker.get_bars(
+            ["AAPL"], TimeFrame.DAY, start=datetime(2000, 1, 1)
+        )
+
+    assert result == {}
+    req = stock.requests[0]
+    # Start clamped to Alpaca's 2016 history floor...
+    assert req.start.year == 2016
+    # ...and the SIP end pulled behind the free-tier 15-minute cutoff. The SDK
+    # normalises request datetimes to naive UTC, so compare in that form.
+    now_utc = datetime.now(timezone.utc).replace(tzinfo=None)
+    assert req.end <= now_utc - _FREE_TIER_DELAY
+    text = caplog.text
+    assert "Alpaca data begins" in text
+    assert "No bars returned" in text and "AAPL" in text

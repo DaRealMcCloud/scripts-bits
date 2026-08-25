@@ -212,6 +212,49 @@ class StateStore:
             ).fetchall()
         return [dict(r) for r in reversed(rows)]
 
+    def equity_curve(self, max_points: int = 1000, since: str | None = None) -> list[dict]:
+        """Equity history, evenly thinned to ``max_points`` rows.
+
+        Spans everything by default; pass ``since`` (an ISO timestamp) to limit
+        it to a recent window. ``equity_series`` keeps only the newest N
+        snapshots, so with a snapshot every heartbeat the curve (and anything
+        derived from its first point) silently starts days after the bot did.
+        This spans the requested range instead, always retaining the newest
+        point.
+        """
+        max_points = max(int(max_points), 2)
+        where = "WHERE ts >= ?" if since else ""
+        window: tuple = (since,) if since else ()
+        with self._lock:
+            total = self._conn.execute(
+                f"SELECT COUNT(*) FROM equity_snapshots {where}", window
+            ).fetchone()[0]
+            if not total:
+                return []
+            stride = max(1, -(-total // max_points))  # ceil division
+            rows = self._conn.execute(
+                f"""
+                SELECT ts, equity, cash FROM (
+                    SELECT ts, equity, cash,
+                           ROW_NUMBER() OVER (ORDER BY ts) - 1 AS rn
+                    FROM equity_snapshots {where}
+                )
+                WHERE rn % ? = 0 OR rn = ?
+                ORDER BY ts
+                """,
+                (*window, stride, total - 1),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def first_equity(self) -> dict | None:
+        """Oldest equity snapshot — the baseline for all-time return."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT ts, equity, cash, unrealized_pl FROM equity_snapshots "
+                "ORDER BY ts ASC LIMIT 1"
+            ).fetchone()
+        return dict(row) if row else None
+
     def latest_equity(self) -> dict | None:
         """Return the most recent full equity snapshot (equity, cash, P&L, ts)."""
         with self._lock:
