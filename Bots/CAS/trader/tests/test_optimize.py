@@ -15,13 +15,15 @@ Everything uses the in-memory FakeBroker / synthetic bars — no network.
 from __future__ import annotations
 
 import math
-from datetime import datetime
+from concurrent.futures import ProcessPoolExecutor
+from datetime import datetime, timedelta
 
 from trader.backtest import Backtester
 from trader.config import Config, config_to_dict, dump_config, load_config
 from trader.data.universe import _avg_daily_volumes, _rank_by_volume
 from trader.optimize.data_cache import BarCache, load_cache, save_cache
-from trader.optimize.evaluator import EvalRequest, evaluate_config
+from trader.optimize.__main__ import _cache_is_current
+from trader.optimize.evaluator import EvalRequest, evaluate_config, evaluate_configs_parallel
 from trader.optimize.optimizer import (
     Optimizer,
     ParamSpec,
@@ -165,6 +167,44 @@ def test_evaluate_config_is_deterministic():
     r2 = evaluate_config(req)
     assert r1.score == r2.score
     assert r1.n_folds_evaluated == r2.n_folds_evaluated
+
+
+def test_parallel_evaluator_matches_serial_reference():
+    series = _uptrend_universe(n_symbols=8, length=180)
+    cfg = Config()
+    cfg.strategies.momentum.slow_lookback = 30
+    requests = [
+        EvalRequest(
+            cfg=cfg,
+            series=series,
+            strategy="momentum",
+            n_symbol_folds=3,
+            n_time_windows=2,
+            weights=ScoreWeights(min_trades=0),
+        ),
+        EvalRequest(
+            cfg=cfg,
+            series=series,
+            strategy="momentum",
+            n_symbol_folds=2,
+            n_time_windows=3,
+            weights=ScoreWeights(min_trades=0),
+        ),
+    ]
+
+    serial = [evaluate_config(request) for request in requests]
+    with ProcessPoolExecutor(max_workers=2) as executor:
+        parallel = evaluate_configs_parallel(requests, executor)
+
+    for expected, actual in zip(serial, parallel):
+        assert actual.score == expected.score
+        assert actual.train_score == expected.train_score
+        assert actual.validation_score == expected.validation_score
+        assert actual.total_return_pct == expected.total_return_pct
+        assert actual.max_drawdown_pct == expected.max_drawdown_pct
+        assert actual.num_trades == expected.num_trades
+        assert actual.n_folds_evaluated == expected.n_folds_evaluated
+        assert actual.per_fold_scores == expected.per_fold_scores
 
 
 def test_symbol_folds_are_stable():
@@ -338,6 +378,22 @@ def test_bar_cache_roundtrip(tmp_path):
     assert reloaded is not None
     assert set(reloaded.bars) == {"AAA", "BTC/USD"}
     assert reloaded.subset(["AAA"]).keys() == {"AAA"}
+
+
+def test_cache_current_requires_requested_history_and_asset_class():
+    now = datetime.now()
+    cache = BarCache(
+        bars={"BTC/USD": make_bars("BTC/USD", [4, 5, 6])},
+        start=now - timedelta(days=365),
+        end=now,
+    )
+    crypto_args = type("Args", (), {"days": 300, "strategy": "crypto_momentum"})()
+    equity_args = type("Args", (), {"days": 300, "strategy": "momentum"})()
+
+    assert _cache_is_current(cache, crypto_args)
+    assert not _cache_is_current(cache, equity_args)
+    crypto_args.days = 500
+    assert not _cache_is_current(cache, crypto_args)
 
 
 def test_load_cache_missing_returns_none(tmp_path):

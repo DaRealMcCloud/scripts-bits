@@ -1,118 +1,60 @@
-# ─────────────────────────────────────────────────────────────
-# Trading Bot — Example Configuration
-# Copy to config.yaml and fill in values. NEVER commit config.yaml.
-#
-# Secrets come from environment variables, NOT this file:
-#   Alpaca : ALPACA_API_KEY, ALPACA_SECRET_KEY
-#   IBKR   : (no API key — you log into the Client Portal Gateway in a browser)
-#            optional: IBKR_ACCOUNT_ID, IBKR_BASE_URL, BROKER_PROVIDER
-# ─────────────────────────────────────────────────────────────
-
-# Which broker adapter to use: "alpaca" (default) or "ibkr".
-# Can be overridden with the BROKER_PROVIDER environment variable.
+alpaca:
+  mode: paper
+  data_feed: iex
+ibkr:
+  base_url: https://localhost:5000/v1/api
+  account_id: ''
+  verify_ssl: false
+  keepalive_interval: 45
+  rate_per_sec: 9.0
+  suppress_message_ids:
+  - o354
+  - o163
+  - o382
+  - o451
 broker:
   provider: alpaca
-
-# ── Alpaca (used when broker.provider = alpaca) ──────────────
-alpaca:
-  # "paper" (default, works out of the box) or "live"
-  mode: paper
-  # Prefer env vars ALPACA_API_KEY / ALPACA_SECRET_KEY over inlining here.
-  # api_key: ""
-  # secret_key: ""
-  # Historical bars (live scans, backtests, optimizer cache) come from this feed.
-  # "iex" is free: history since 2016, IEX-only coverage, no recency limit.
-  # "sip" is full-market but needs Algo Trader Plus; on the free plan its latest
-  # 15 minutes are withheld (the adapter clamps the request end accordingly).
-  data_feed: iex
-
-# ── Interactive Brokers (used when broker.provider = ibkr) ───
-# IBKR trading goes through the local Client Portal Gateway, which you must
-# start and log into (2FA in a browser) BEFORE running the bot. See README.
-ibkr:
-  # The gateway's base URL (default local install).
-  base_url: https://localhost:5000/v1/api
-  # Leave blank to auto-discover the first account from /portfolio/accounts,
-  # or set IBKR_ACCOUNT_ID. Use your paper account (starts with "DU") for testing.
-  account_id: ""
-  # The gateway uses a self-signed certificate; leave false unless you have
-  # installed a trusted cert.
-  verify_ssl: false
-  # Keepalive ping interval (seconds) to hold the brokerage session open.
-  keepalive_interval: 45
-  # Client-side request rate cap (IBKR rejects bursts > ~10 req/s).
-  rate_per_sec: 9.0
-  # Order-confirmation dialog ids to auto-suppress (see IBKR docs).
-  suppress_message_ids: ["o354", "o163", "o382", "o451"]
-
 universe:
-  # Minimum average daily volume (shares) to include a stock.
   min_avg_volume: 500000
-  # Explicit equity symbols.
-  #   • REQUIRED for IBKR (no bulk asset-listing endpoint).
-  #   • OPTIONAL for Alpaca (added to the auto-discovered universe).
   stocks:
-    - AAPL
-    - MSFT
-    - NVDA
-    - AMZN
-    - GOOGL
-    - META
-    - TSLA
-  # Commodity / resource ETFs to always include
+  - AAPL
+  - MSFT
+  - NVDA
+  - AMZN
+  - GOOGL
+  - META
+  - TSLA
   etfs:
-    - GLD    # Gold
-    - SLV    # Silver
-    - USO    # Oil
-    - XLE    # Energy sector
-    - COPX   # Copper miners
-    - XLB    # Materials sector
-  # Crypto pairs (only used if the active broker supports crypto — Alpaca does).
-  # Use the single sentinel [ALL/ALL] to auto-discover and trade EVERY tradable
-  # crypto pair from the broker (Alpaca only). Discovery is restricted to the
-  # `crypto_quote` currency below and, if `min_crypto_volume` > 0, volume-filtered.
+  - GLD
+  - SLV
+  - USO
+  - XLE
+  - COPX
+  - XLB
   crypto:
-    - ALL/ALL
-  # Quote currency for auto-discovered crypto (ALL/ALL only). Drops USDT/USDC/BTC
-  # duplicates. Explicit lists are never filtered.
+  - ALL/ALL
   crypto_quote: USD
-  # Average-daily-volume floor for auto-discovered crypto (ALL/ALL only). 0 = off.
-  # Crypto volume is in base-currency units, not shares — tune with care.
   min_crypto_volume: 0
-
+  max_crypto_symbols: 100
+  max_discovered: 500
 strategies:
-  # ── Core strategies ───────────────────────────────────────
   momentum:
     enabled: true
-    # Lookback windows in trading days
-    fast_lookback: 20
-    slow_lookback: 60
-    # Number of top-ranked symbols to trade
-    top_n: 10
-    # Minimum fundamental quality thresholds
+    fast_lookback: 16
+    slow_lookback: 62
+    top_n: 9
     min_roe: 0.05
     max_debt_equity: 3.0
-    min_gross_margin: 0.20
-
+    min_gross_margin: 0.2
   gap_fade:
     enabled: true
-    # Minimum gap percentage to trigger a trade
     min_gap_pct: 2.0
-    # Target retracement as fraction of gap (0.5 = fade 50% of gap)
     target_retracement: 0.5
-    # Max number of gap fade trades per day
     max_daily_trades: 5
-
   quote_imbalance:
-    # Requires streaming quotes (broker.capabilities.supports_streaming).
     enabled: true
-    # Rolling window for imbalance calculation (number of quotes)
     window_size: 50
-    # Minimum imbalance score to act on (-1 to 1 scale)
     min_score: 0.3
-
-  # ── Expanded strategy family (disabled by default) ────────
-  # `weight` scales a strategy's contribution in the aggregator.
   trend_following:
     enabled: false
     weight: 1.0
@@ -120,7 +62,6 @@ strategies:
     slow_ma: 50
     adx_min: 20.0
     top_n: 10
-
   mean_reversion:
     enabled: false
     weight: 1.0
@@ -128,42 +69,34 @@ strategies:
     zscore_entry: -2.0
     rsi_oversold: 30.0
     top_n: 10
-
   breakout:
     enabled: false
     weight: 1.0
     channel: 20
     top_n: 10
-
   volatility:
     enabled: false
     weight: 1.0
     lookback: 20
     low_vol_pct: 0.15
-    high_vol_pct: 0.50
+    high_vol_pct: 0.5
     top_n: 5
-
   pairs_trading:
     enabled: false
     weight: 1.0
     lookback: 60
     zscore_entry: 2.0
-    # Cointegrated pairs as "SYM_A/SYM_B".
     pairs:
-      - "KO/PEP"
-      - "GLD/SLV"
-
+    - KO/PEP
+    - GLD/SLV
   dca:
-    # Dollar-cost averaging into a fixed symbol list on a cadence.
     enabled: false
     weight: 1.0
     symbols:
-      - SPY
-      - QQQ
+    - SPY
+    - QQQ
     cadence_days: 7
-
   rebalance:
-    # Rebalance toward target portfolio weights when drift exceeds drift_pct.
     enabled: false
     weight: 1.0
     targets:
@@ -171,78 +104,59 @@ strategies:
       GLD: 0.2
       TLT: 0.2
     drift_pct: 0.05
-
   ml:
-    # Optional machine-learning strategy (see trader.strategies.ml_base).
     enabled: false
     weight: 1.0
-    model_path: ""
+    model_path: ''
     top_n: 10
-
-  # ── Decision-support: signal aggregator (the "which trades" brain) ──
   aggregator:
     enabled: true
-    # Max candidate trades to act on per scan.
     top_n: 10
-    # Minimum combined score to trade (strength × confidence × weight × regime_fit).
     min_score: 0.05
-    # Up-/down-weight strategies suited to the current market regime.
     use_regime_routing: true
     regime_fit_bonus: 1.5
     regime_fit_penalty: 0.5
-    # Symbol used to classify the overall market regime.
     regime_benchmark: SPY
-
   sentiment:
-    # Optional news/social sentiment overlay on signal confidence.
     enabled: false
     weight: 0.2
-
-  # ── Crypto strategies (long-only, 24/7) ──────────────────────────
-  # Crypto on Alpaca is spot/cash only: no shorting, no margin, no broker-side
-  # stops/brackets, orders must be GTC. Long-only; runs on its own 7-day loop.
   crypto:
-    enabled: true
+    enabled: false
     scan_interval_minutes: 15
-    # Check open positions against stops / take-profit every 5 min (more often
-    # than the 15-min opportunity scan) so a fast drop can't wipe out a
-    # position between scans. Keep <= scan_interval_minutes.
     stop_check_interval_minutes: 5
-    # Cancel resting (unfilled) crypto entry orders older than this many minutes
-    # (crypto orders are GTC and never auto-expire otherwise). 0 disables it.
     crypto_order_ttl_minutes: 30
     trailing_stop: false
     trail_pct: 0.05
     momentum:
       enabled: true
       weight: 1.0
-      fast_ma: 20
-      slow_ma: 50
-      adx_min: 20.0
+      fast_ma: 21
+      slow_ma: 29
+      adx_min: 20.15625
       top_n: 10
     mean_reversion:
-      enabled: true
+      enabled: false
       weight: 1.0
       lookback: 20
       zscore_entry: -2.0
       rsi_oversold: 30.0
       top_n: 10
     breakout:
-      enabled: true
+      enabled: false
       weight: 1.0
       channel: 20
       top_n: 10
     dca:
-      enabled: true
+      enabled: false
       weight: 1.0
       symbols: []
       cadence_hours: 24
     volatility:
-      enabled: true
+      enabled: false
       weight: 1.0
       lookback: 20
-      low_vol_pct: 0.40
-      high_vol_pct: 1.20
+      low_vol_pct: 0.4
+      high_vol_pct: 1.2
       top_n: 5
     aggregator:
       enabled: true
@@ -252,53 +166,23 @@ strategies:
       regime_fit_bonus: 1.5
       regime_fit_penalty: 0.5
       regime_benchmark: BTC/USD
-
 risk:
-  # Max fraction of equity risked per trade.
-  # 3-5-7 rule: risk ≤3% of capital on a single trade.
-  max_risk_per_trade: 0.03
-  # Maximum number of open positions (total across equity + crypto).
-  # 3-5-7 rule: keep total exposure modest so no cluster of trades can blow up
-  # the account. ~5 concurrent positions ≈ ~15% equity at 3% risk each.
-  max_positions: 100
-  # Daily drawdown limit — stop trading if equity drops by this fraction
+  max_risk_per_trade: 0.005
+  max_positions: 15
+  max_crypto_positions: 0
   max_daily_drawdown: 0.05
-  # ATR multiplier for trailing stop
-  atr_stop_multiplier: 2.0
-  # Maximum days to hold a position (0 = no limit)
-  max_hold_days: 5
-  # Flatten all intraday positions before market close
+  atr_stop_multiplier: 6.0
+  max_hold_days: 1
   flatten_eod: true
-  # Also flatten crypto at the equity close (default false: keep 24/7 crypto open).
   flatten_crypto_eod: false
-  # Max open crypto positions, counted separately from equities (0 = unlimited).
-  # Cap crypto so all-5-strategies can't fully invest a small account at once.
-  max_crypto_positions: 50
-  # ── Fee-aware edge gate ───────────────────────────────────
-  # Estimated round-trip trading cost as a fraction of notional (both legs).
-  # Alpaca crypto is ~0.15-0.25% per side → ~0.005 round trip. 0 disables the gate.
-  # Per-side maker/taker fees (fractions). The fee gate uses `taker_fee_pct * 2`.
-  # Alpaca Level 1: maker 0.15% (0.0015), taker 0.25% (0.0025)
   maker_fee_pct: 0.0015
   taker_fee_pct: 0.0025
-  # A trade is only taken if its expected favourable move (entry→stop distance)
-  # exceeds round-trip fees by this factor. Blocks thin-margin scalps that fees
-  # would eat. 2.0 = expected edge must be ≥2× the fee drag.
   min_edge_multiple: 2.0
-  # 3-5-7 rule: aim for ≥7% on winners. Take-profit target as a fraction above
-  # entry for crypto software exits (0 = disabled).
-  take_profit_pct: 0.07
-
-# ── Local web dashboard (optional; requires the `web` extra) ─
-web:
-  # When enabled and hosted via the supervisor, serves a live dashboard.
-  enabled: true
-  # Bind to loopback only. Do NOT expose publicly without an auth proxy.
-  host: 0.0.0.0
-  port: 8787
-
+  take_profit_pct: 0.0
 logging:
-  # Log directory (relative to project root)
   log_dir: logs
-  # Log level: DEBUG, INFO, WARNING, ERROR
   level: INFO
+web:
+  enabled: false
+  host: 127.0.0.1
+  port: 8787

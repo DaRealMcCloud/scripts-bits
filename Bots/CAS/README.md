@@ -254,6 +254,12 @@ composite metric, and nudges the parameters toward the changes that improve
 results — then periodically pushes *further* in the directions that have been
 helping. Runs can be long; that is expected.
 
+The optimizer caches approximately **10 years** of history by default (as far
+back as the broker provides). Use `--days` to choose a different window; for
+example, `--days 1825` requests five years. `--refresh-cache` is required when
+changing the window or downloading newer data instead of reusing the existing
+cache.
+
 ```powershell
 # 1. Build (or refresh) the on-disk bar cache once. Equities are volume-ranked,
 #    so --max-symbols keeps the MOST LIQUID names, not an arbitrary first N.
@@ -262,9 +268,101 @@ python -m trader.optimize --refresh-cache --max-symbols 500 --cache-only
 # 2. Optimise equity momentum for 40 rounds across all CPU cores.
 python -m trader.optimize --strategy momentum --rounds 40
 
-# 3. Optimise crypto momentum, then apply the winner to config.yaml.
+# 3. Optimise crypto momentum, compare old/new performance, then apply the winner.
 python -m trader.optimize --strategy crypto_momentum --rounds 40 --apply
 ```
+
+More useful command combinations:
+
+```powershell
+# 4. Refresh five years of equity data, then optimise from that fresh cache.
+python -m trader.optimize --strategy momentum --days 1825 `
+  --max-symbols 500 --refresh-cache --rounds 100 --workers 18
+
+# 5. Refresh 2,000 days of crypto data in a separate cache, without optimising yet.
+python -m trader.optimize --strategy crypto_momentum --days 2000 `
+  --cache data/backtest_cache/crypto-2000d.pkl --refresh-cache --cache-only
+
+# 6. Optimise the previously downloaded crypto cache with 18 workers.
+python -m trader.optimize --strategy crypto_momentum `
+  --cache data/backtest_cache/crypto-2000d.pkl --rounds 200 --workers 18 `
+  --out-dir data/optimize/crypto-momentum
+
+# 7. Resume an interrupted run from its saved state and report.
+python -m trader.optimize --strategy crypto_momentum --resume `
+  --cache data/backtest_cache/crypto-2000d.pkl `
+  --out-dir data/optimize/crypto-momentum --rounds 100
+
+# 8. Start a clean experiment with global restarts every 20 rounds.
+python -m trader.optimize --strategy momentum --rounds 200 `
+  --restart-every 20 --workers 18 --out-dir data/optimize/momentum-v2
+
+# 9. Run serially for reproducible debugging or when RAM is limited.
+python -m trader.optimize --strategy crypto_momentum --rounds 20 --workers 1 `
+  --cache data/backtest_cache/crypto-2000d.pkl
+
+# 10. Use stronger drawdown and variance penalties for a more conservative winner.
+python -m trader.optimize --strategy momentum --rounds 100 --workers 18 `
+  --w-drawdown 1.0 --w-symbol-var 1.0 --w-fold-var 1.0
+
+# 11. Disable the final holdout split when comparing a legacy experiment only.
+python -m trader.optimize --strategy momentum --rounds 50 --workers 18 `
+  --holdout-frac 0 --out-dir data/optimize/no-holdout
+
+# 12. Review a result in a new directory, then apply it only after inspection.
+python -m trader.optimize --strategy crypto_momentum --rounds 150 `
+  --workers 18 --out-dir data/optimize/crypto-reviewed
+python -m trader.optimize --strategy crypto_momentum --rounds 0 --resume --apply `
+  --out-dir data/optimize/crypto-reviewed
+```
+
+Whenever `--apply` is used, the optimizer automatically runs the old config and
+the winning config against the same cached symbols, daily bars, and date window
+used by the optimization. It prints a side-by-side table containing ending
+equity, total return, closed trades, win rate, and maximum drawdown, together
+with the change from old to new. The same data is saved as
+`backtest_comparison_<strategy>.csv` under `--out-dir`. The comparison runs
+before the config is overwritten, so the old column is the actual configuration
+that was loaded for the run.
+
+The last command is only appropriate when the saved result is already the
+winner you intend to apply; normally use `--apply` on the same run that created
+the report. Applying writes the winning values to the config file and backs up
+the previous file as `config.yaml.bak`. Use a new `--out-dir` for a clean
+experiment after changing the objective, history window, bounds, or strategy.
+
+### Optimizer switches and defaults
+
+| Switch | Default | Meaning |
+| ------ | ------- | ------- |
+| `--strategy` | `momentum` | Strategy to optimise: `momentum`, `crypto_momentum`, or `crypto_volatility`. |
+| `--rounds` | `20` | Number of search rounds. More rounds allow more search, but do not replace fresh data or validation. |
+| `--workers` | `0` | `0` uses all logical CPUs; `1` is serial. Use `18` explicitly on an 18-core machine. |
+| `--max-symbols` | `500` | Maximum symbols per asset class in a newly built cache. |
+| `--days` | `3650` | Historical cache window, approximately 10 years, limited by broker availability. |
+| `--config` | `config.yaml` | Base configuration file. |
+| `--cache` | `data/backtest_cache/bars.pkl` | Bar-cache pickle path. Use separate paths for equity and crypto caches. |
+| `--out-dir` | `data/optimize` | State, CSV report, and optimized config output directory. |
+| `--refresh-cache` | off | Re-download bars instead of reusing the cache. Required after changing `--days`. |
+| `--cache-only` | off | Build/load the cache and exit before optimization. |
+| `--resume` | off | Continue the optimizer state saved under `--out-dir`. Do not use for a clean experiment. |
+| `--apply` | off | Write the winner to `--config`, after backing up the existing config. |
+| `--restart-every` | `8` | Global restart interval in rounds; `0` disables restarts. |
+| `--stagnation-patience` | `100` | Stop after this many non-improving rounds; `0` disables this stop. |
+| `--seed` | `0` | Deterministic random seed for restarts and evaluation splits. |
+| `--w-drawdown` | `0.5` | Penalty weight for maximum drawdown. |
+| `--w-symbol-var` | `0.5` | Penalty weight for return variation across symbols. |
+| `--w-fold-var` | `0.5` | Penalty weight for score variation across folds/windows. |
+| `--min-trades` | `20` | Minimum closed trades before a sparse-result penalty applies. |
+| `--holdout-frac` | `0.2` | Fraction of history reserved for the final holdout evaluation; `0` disables it. |
+
+Recommended clean workflow:
+
+1. Build a named cache with the desired history window using `--refresh-cache --cache-only`.
+2. Optimise into a new `--out-dir` with `--workers 18` and a fixed `--seed`.
+3. Review `optimize_report_<strategy>.csv`, especially validation, holdout, and boundary values.
+4. Run a separate confirmation experiment with another `--seed` or time window.
+5. Apply only after both experiments support the same parameter region.
 
 ### How it resists over-fitting
 
@@ -286,9 +384,24 @@ single symbol's curve. Three mechanisms enforce this:
 
 ### Compute & parallelism
 
-Candidate and fold evaluations are spread across CPU cores with a process pool
-(`--workers 0` = all cores, `1` = serial). The bar download is cached to disk
+Candidate fold/window evaluations are spread across CPU cores with a reusable
+process pool. `--workers 0` uses all logical CPUs reported by Python; on a
+machine with 18 available cores, use `--workers 18` explicitly or leave the
+default `--workers 0`. The optimizer now schedules individual fold/window
+evaluations, so normal rounds can keep all workers busy even when there are
+fewer candidate parameter sets than cores. `--workers 1` forces serial mode.
+
+The bar download remains sequential and is cached to disk
 (`data/backtest_cache/bars.pkl`) so thousands of evaluations reuse one fetch.
+Parallel workers require additional memory because cached bar data is shared
+with spawned worker processes on Windows.
+
+Every eighth round performs a global restart: it samples diverse parameter
+sets across the configured bounds and evaluates at least twice the worker
+count when possible. This helps escape local optima instead of repeatedly
+searching only around the current winner. After changing the objective or
+parameter bounds, start a fresh run without `--resume` and use a new
+`--out-dir` if you want to preserve older reports.
 
 ### Tunable parameters
 
@@ -337,9 +450,11 @@ See `config.example.yaml` for the fully-commented schema. Highlights:
 ### Trading all available crypto
 
 `universe.crypto` accepts an explicit list of pairs (e.g. `BTC/USD`, `ETH/USD`)
-or the single sentinel `ALL/ALL` (case-insensitive). With `ALL/ALL`, the bot
-auto-discovers **every tradable crypto pair** from the broker (Alpaca only —
-IBKR has no crypto support) and trades all of them:
+or the single sentinel `ALL/ALL` (case-insensitive). The default configuration
+uses `ALL/ALL`, auto-discovers Alpaca's tradable crypto pairs, and keeps the top
+100 by average daily volume. (IBKR has no crypto support.) Set
+`max_crypto_symbols: 0` for all discovered pairs, or provide an explicit list
+to bypass discovery and the cap:
 
 ```yaml
 universe:
@@ -347,6 +462,7 @@ universe:
     - ALL/ALL
   crypto_quote: USD        # only keep pairs quoted in this currency (dedupes USDT/USDC/BTC)
   min_crypto_volume: 0     # optional avg-daily-volume floor; 0 = off
+  max_crypto_symbols: 100   # top volume-ranked discovered pairs; 0 = unlimited
 ```
 
 - `crypto_quote` (default `USD`) filters discovered pairs to one quote currency,

@@ -63,12 +63,15 @@ class Trade:
     exit_price: float | None = None
     qty: float = 0.0
     reason: str = ""
+    entry_fee: float = 0.0
+    exit_fee: float = 0.0
 
     @property
     def pnl(self) -> float:
         if self.exit_price is None:
             return 0.0
-        return (self.exit_price - self.entry_price) * self.qty
+        gross = (self.exit_price - self.entry_price) * self.qty
+        return gross - self.entry_fee - self.exit_fee
 
     @property
     def return_pct(self) -> float:
@@ -220,13 +223,14 @@ class Backtester:
             for sym, trade in list(open_trades.items()):
                 sym_bars = series.get(sym, [])
                 today = self._bar_on(sym_bars, date)
-                if today is None:
+                if today is None or date.date() < trade.entry_date.date():
                     continue
                 stop_hit = today.low <= self._stop_price(sym_bars, trade.entry_price, idx)
                 held_days = (date - trade.entry_date).days
                 if stop_hit or held_days >= self.cfg.risk.max_hold_days:
                     trade.exit_date = date
                     trade.exit_price = today.close
+                    trade.exit_fee = self._trading_cost(trade.exit_price, trade.qty)
                     trade.reason = "stop" if stop_hit else "time_exit"
                     equity += trade.pnl
                     del open_trades[sym]
@@ -249,7 +253,11 @@ class Backtester:
                 if qty <= 0 or (not self._fractional and qty < 1):
                     continue
                 open_trades[sym] = Trade(
-                    symbol=sym, entry_date=date, entry_price=entry, qty=qty
+                    symbol=sym,
+                    entry_date=next_bar.timestamp,
+                    entry_price=entry,
+                    qty=qty,
+                    entry_fee=self._trading_cost(entry, qty),
                 )
                 result.trades.append(open_trades[sym])
 
@@ -258,6 +266,7 @@ class Backtester:
                 (self._bar_on(series[s], date).close - t.entry_price) * t.qty
                 for s, t in open_trades.items()
                 if self._bar_on(series[s], date)
+                and date.date() >= t.entry_date.date()
             )
             result.equity_curve.append((date, mtm))
 
@@ -266,6 +275,7 @@ class Backtester:
             last = series[sym][-1]
             trade.exit_date = last.timestamp
             trade.exit_price = last.close
+            trade.exit_fee = self._trading_cost(trade.exit_price, trade.qty)
             trade.reason = "eod_close"
             equity += trade.pnl
 
@@ -293,6 +303,11 @@ class Backtester:
         if self.strategy == "crypto_volatility":
             return s.crypto.volatility.top_n
         return 10
+
+    def _trading_cost(self, price: float, qty: float) -> float:
+        """Return one-side estimated taker fee for a simulated fill."""
+        fee_rate = max(0.0, float(getattr(self.cfg.risk, "taker_fee_pct", 0.0)))
+        return abs(price * qty) * fee_rate
 
     # ── bar helpers ──────────────────────────────────────────
     @staticmethod

@@ -72,18 +72,18 @@ universe:
     - XLB    # Materials sector
   # Crypto pairs (only used if the active broker supports crypto — Alpaca does).
   # Use the single sentinel [ALL/ALL] to auto-discover and trade EVERY tradable
-  # crypto pair from the broker (Alpaca only). Discovery is restricted to the
-  # `crypto_quote` currency below and, if `min_crypto_volume` > 0, volume-filtered.
+  # crypto pairs from the broker (Alpaca only). Discovered pairs are ranked by
+  # volume and capped at 100 by default.
   crypto:
-    - BTC/USD
-    - ETH/USD
-    # - ALL/ALL   # uncomment (and remove the pairs above) to trade all crypto
+    - ALL/ALL
   # Quote currency for auto-discovered crypto (ALL/ALL only). Drops USDT/USDC/BTC
   # duplicates. Explicit lists above are never filtered.
   crypto_quote: USD
   # Average-daily-volume floor for auto-discovered crypto (ALL/ALL only). 0 = off.
   # Crypto volume is in base-currency units, not shares — tune with care.
   min_crypto_volume: 0
+  # Maximum volume-ranked pairs from auto-discovery; 0 = unlimited.
+  max_crypto_symbols: 100
 
 strategies:
   # ── Core strategies ───────────────────────────────────────

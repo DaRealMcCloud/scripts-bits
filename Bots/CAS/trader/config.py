@@ -83,10 +83,9 @@ class UniverseConfig:
     stocks: list[str] = field(default_factory=list)
     etfs: list[str] = field(default_factory=lambda: ["GLD", "SLV", "USO", "XLE"])
     # Explicit crypto pairs, OR the single sentinel ["ALL/ALL"] to auto-discover
-    # every tradable crypto pair from the broker (Alpaca only). When ALL/ALL is
-    # used, discovery is restricted to pairs quoted in ``crypto_quote`` and, if
-    # ``min_crypto_volume`` > 0, filtered by average daily volume.
-    crypto: list[str] = field(default_factory=lambda: ["BTC/USD", "ETH/USD"])
+    # tradable pairs from the broker (Alpaca only). Discovered pairs are ranked
+    # by volume and capped by ``max_crypto_symbols``.
+    crypto: list[str] = field(default_factory=lambda: ["ALL/ALL"])
     # Quote currency used to filter auto-discovered crypto (ALL/ALL only). Keeps
     # the universe clean by dropping USDT/USDC/BTC-quoted duplicates. Explicit
     # crypto lists are never filtered.
@@ -95,6 +94,9 @@ class UniverseConfig:
     # (ALL/ALL). 0 disables it. Note: crypto volume is in base-currency units, so
     # magnitudes differ from equity share volume — tune with care.
     min_crypto_volume: int = 0
+    # Maximum number of volume-ranked discovered crypto pairs. Explicit lists
+    # are never capped.
+    max_crypto_symbols: int = 100
     # When a broker exposes a very large bulk listing (e.g. 7000+ equities)
     # building volume history for every symbol can be slow on constrained
     # hardware (Raspberry Pi). Set `max_discovered` to a positive integer to

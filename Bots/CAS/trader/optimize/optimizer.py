@@ -34,7 +34,12 @@ from pathlib import Path
 
 from trader.brokers.types import Bar
 from trader.config import Config
-from trader.optimize.evaluator import EvalRequest, EvalResult, evaluate_config
+from trader.optimize.evaluator import (
+    EvalRequest,
+    EvalResult,
+    evaluate_config,
+    evaluate_configs_parallel,
+)
 from trader.optimize.scoring import ScoreWeights
 
 logger = logging.getLogger(__name__)
@@ -194,6 +199,7 @@ class Optimizer:
         self.state.current_params = {s.path: get_param(self.cfg, s.path) for s in self.specs}
         self.state.direction_bias = {s.path: 0.0 for s in self.specs}
         self.state.step_sizes = {s.path: s.step for s in self.specs}
+        self._pool: ProcessPoolExecutor | None = None
 
     # ── candidate generation ─────────────────────────────────
     def _apply(self, params: dict[str, float]) -> Config:
@@ -259,20 +265,29 @@ class Optimizer:
         return unique
 
     def _local_restarts(
-        self, current: dict[str, float], count: int = 4
+        self, current: dict[str, float], count: int | None = None
     ) -> list[dict[str, float]]:
-        """Generate feasible local perturbations around the incumbent."""
+        """Generate diverse global restarts across the bounded search space."""
+        count = count or max(4, self.workers * 2)
         candidates: list[dict[str, float]] = []
-        for _ in range(count):
-            candidate = dict(current)
+        seen: set[tuple[tuple[str, float], ...]] = set()
+        attempts = 0
+        while len(candidates) < count and attempts < count * 20:
+            attempts += 1
+            candidate: dict[str, float] = {}
             for spec in self.specs:
-                radius = 2.0 * self._step_for(spec)
                 candidate[spec.path] = _clamp(
-                    current[spec.path] + self.rng.uniform(-radius, radius), spec
+                    self.rng.uniform(spec.lo, spec.hi), spec
                 )
-            if candidate != current and self._is_feasible(candidate):
+            key = tuple(sorted(candidate.items()))
+            if (
+                candidate != current
+                and key not in seen
+                and self._is_feasible(candidate)
+            ):
+                seen.add(key)
                 candidates.append(candidate)
-        logger.info("Local restart: generated %d feasible candidates", len(candidates))
+        logger.info("Global restart: generated %d feasible candidates", len(candidates))
         return candidates
 
     def _adapt_steps(
@@ -281,6 +296,7 @@ class Optimizer:
         candidates: list[dict[str, float]],
         results: list[EvalResult],
         accepted: bool,
+        incumbent_score: float,
     ) -> None:
         """Shrink stagnant dimensions and gently expand useful dimensions."""
         for spec in self.specs:
@@ -304,9 +320,10 @@ class Optimizer:
                     spec.hi - spec.lo,
                     self._step_for(spec) * 1.25,
                 )
-            elif not coordinate_scores or max(coordinate_scores) <= self.state.best_score:
+            elif not coordinate_scores or max(coordinate_scores) <= incumbent_score:
+                minimum_step = 1.0 if spec.is_int else spec.step / 16.0
                 self.state.step_sizes[path] = max(
-                    spec.step / 16.0,
+                    minimum_step,
                     self._step_for(spec) * 0.5,
                 )
 
@@ -350,15 +367,9 @@ class Optimizer:
         requests = [self._make_request(p) for p in param_sets]
         if self.workers <= 1 or len(requests) <= 1:
             return [evaluate_config(r) for r in requests]
-        pool = ProcessPoolExecutor(max_workers=self.workers)
-        try:
-            results = list(pool.map(_eval_worker, requests))
-        except KeyboardInterrupt:
-            pool.shutdown(wait=False, cancel_futures=True)
-            raise
-        else:
-            pool.shutdown(wait=True)
-            return results
+        if self._pool is None:
+            self._pool = ProcessPoolExecutor(max_workers=self.workers)
+        return evaluate_configs_parallel(requests, self._pool)
 
     # ── main loop ─────────────────────────────────────────────
     def run(self, rounds: int, on_round=None) -> OptimizerState:
@@ -389,7 +400,8 @@ class Optimizer:
                 best_cand = candidates[best_idx]
                 best_res = results[best_idx]
 
-                accepted = best_res.score > self.state.best_score
+                incumbent_score = self.state.best_score
+                accepted = best_res.score > incumbent_score
                 changed: dict[str, float] = {}
                 if accepted:
                     # Update direction bias for every param that moved.
@@ -407,7 +419,9 @@ class Optimizer:
                 else:
                     logger.info("Round %d no improvement (best cand %s)", round_no, best_res.summary())
 
-                self._adapt_steps(current, candidates, results, accepted)
+                self._adapt_steps(
+                    current, candidates, results, accepted, incumbent_score
+                )
                 holdout_score = (
                     self._evaluate_holdout(self.state.best_params) if accepted else None
                 )
@@ -438,6 +452,13 @@ class Optimizer:
                 "Optimisation interrupted after %d completed rounds; keeping the best result found so far.",
                 self.state.completed_rounds,
             )
+        finally:
+            if self._pool is not None:
+                self._pool.shutdown(
+                    wait=not self.interrupted,
+                    cancel_futures=self.interrupted,
+                )
+                self._pool = None
 
         return self.state
 

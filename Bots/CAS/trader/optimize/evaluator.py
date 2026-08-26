@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import logging
 import hashlib
+from concurrent.futures import Executor
 from dataclasses import dataclass, field
 from datetime import datetime
 
@@ -75,6 +76,32 @@ class EvalResult:
             f"folds={self.n_folds_evaluated}"
             + (f" holdout={self.holdout_score:+.3f}" if self.holdout_score is not None else "")
         )
+
+
+@dataclass
+class SliceEvalRequest:
+    """One fold/window evaluation dispatched to an optimizer worker."""
+
+    candidate_index: int
+    cfg: Config
+    series: dict[str, list[Bar]]
+    strategy: str
+    starting_equity: float
+    weights: ScoreWeights
+    validation_frac: float
+    fold_index: int
+    window_start: datetime
+    window_end: datetime
+
+
+@dataclass
+class SliceEvalResult:
+    """Scores from one candidate's fold/window slice."""
+
+    candidate_index: int
+    fold_index: int
+    train: tuple[float, float, float, int] | None
+    validation: tuple[float, float, float, int] | None
 
 
 def _symbol_folds(symbols: list[str], n_folds: int, seed: int) -> list[list[str]]:
@@ -161,6 +188,137 @@ def _score_series(
         weights=weights,
     )
     return score, result.total_return_pct, result.max_drawdown_pct, result.num_trades
+
+
+def _evaluate_slice(req: SliceEvalRequest) -> SliceEvalResult:
+    """Evaluate one fold/window without requiring broker state."""
+    win_series = _slice_series(req.series, req.window_start, req.window_end)
+    train_series: dict[str, list[Bar]] = {}
+    validation_series: dict[str, list[Bar]] = {}
+    for symbol, bars in win_series.items():
+        train, validation = _split_train_val(bars, req.validation_frac)
+        if train:
+            train_series[symbol] = train
+        if validation:
+            validation_series[symbol] = validation
+
+    return SliceEvalResult(
+        candidate_index=req.candidate_index,
+        fold_index=req.fold_index,
+        train=_score_series(
+            req.cfg,
+            train_series,
+            req.strategy,
+            req.starting_equity,
+            req.weights,
+        ),
+        validation=_score_series(
+            req.cfg,
+            validation_series,
+            req.strategy,
+            req.starting_equity,
+            req.weights,
+        ),
+    )
+
+
+def _slice_requests(requests: list[EvalRequest]) -> list[SliceEvalRequest]:
+    jobs: list[SliceEvalRequest] = []
+    for candidate_index, req in enumerate(requests):
+        symbols = list(req.series.keys())
+        folds = _symbol_folds(symbols, req.n_symbol_folds, req.seed)
+        windows = _time_windows(req.series, req.n_time_windows)
+        for fold_index, fold_symbols in enumerate(folds):
+            fold_series = {s: req.series[s] for s in fold_symbols if s in req.series}
+            for window_start, window_end in windows:
+                jobs.append(
+                    SliceEvalRequest(
+                        candidate_index=candidate_index,
+                        cfg=req.cfg,
+                        series=fold_series,
+                        strategy=req.strategy,
+                        starting_equity=req.starting_equity,
+                        weights=req.weights,
+                        validation_frac=req.validation_frac,
+                        fold_index=fold_index,
+                        window_start=window_start,
+                        window_end=window_end,
+                    )
+                )
+    return jobs
+
+
+def _aggregate_slice_results(
+    requests: list[EvalRequest], results: list[SliceEvalResult]
+) -> list[EvalResult]:
+    grouped: list[list[SliceEvalResult]] = [[] for _ in requests]
+    for result in results:
+        grouped[result.candidate_index].append(result)
+
+    aggregated: list[EvalResult] = []
+    for req, candidate_results in zip(requests, grouped):
+        fold_scores: list[float] = []
+        train_scores: list[float] = []
+        validation_scores: list[float] = []
+        returns: list[float] = []
+        drawdowns: list[float] = []
+        trades_total = 0
+        for result in sorted(
+            candidate_results, key=lambda item: (item.fold_index, item.candidate_index)
+        ):
+            if result.train is not None:
+                train_scores.append(result.train[0])
+                fold_scores.append(result.train[0])
+                returns.append(result.train[1])
+                drawdowns.append(result.train[2])
+                trades_total += result.train[3]
+            if result.validation is not None:
+                validation_scores.append(result.validation[0])
+
+        if not fold_scores:
+            aggregated.append(
+                EvalResult(
+                    score=float("-inf"),
+                    train_score=float("-inf"),
+                    validation_score=float("-inf"),
+                    total_return_pct=0.0,
+                    max_drawdown_pct=0.0,
+                    num_trades=trades_total,
+                    n_folds_evaluated=0,
+                )
+            )
+            continue
+
+        train_agg = aggregate_fold_scores(train_scores, req.weights)
+        validation_agg = (
+            aggregate_fold_scores(validation_scores, req.weights)
+            if validation_scores
+            else train_agg
+        )
+        aggregated.append(
+            EvalResult(
+                score=0.5 * train_agg + 0.5 * validation_agg,
+                train_score=train_agg,
+                validation_score=validation_agg,
+                total_return_pct=sum(returns) / len(returns) if returns else 0.0,
+                max_drawdown_pct=max(drawdowns) if drawdowns else 0.0,
+                num_trades=trades_total,
+                n_folds_evaluated=len(fold_scores),
+                per_fold_scores=fold_scores,
+            )
+        )
+    return aggregated
+
+
+def evaluate_configs_parallel(
+    requests: list[EvalRequest], executor: Executor
+) -> list[EvalResult]:
+    """Evaluate candidates using independent fold/window jobs."""
+    jobs = _slice_requests(requests)
+    if not jobs:
+        return [evaluate_config(request) for request in requests]
+    results = list(executor.map(_evaluate_slice, jobs))
+    return _aggregate_slice_results(requests, results)
 
 
 def evaluate_config(req: EvalRequest) -> EvalResult:

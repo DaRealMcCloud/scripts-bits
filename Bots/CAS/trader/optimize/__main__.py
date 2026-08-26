@@ -26,13 +26,16 @@ import argparse
 import csv
 import logging
 import shutil
+from datetime import datetime, timedelta
 from pathlib import Path
 
+from trader.backtest import BacktestResult, Backtester
 from trader.brokers.factory import make_broker
 from trader.config import Config, dump_config, load_config
 from trader.logger import setup_logging
 from trader.optimize.data_cache import (
     DEFAULT_CACHE_DIR,
+    DEFAULT_CACHE_DAYS,
     BarCache,
     build_cache,
     load_cache,
@@ -73,7 +76,12 @@ def _parse_args() -> argparse.Namespace:
         default=500,
         help="Cap symbols per asset class; equities are volume-ranked first",
     )
-    p.add_argument("--days", type=int, default=1095, help="History window to cache (days)")
+    p.add_argument(
+        "--days",
+        type=int,
+        default=DEFAULT_CACHE_DAYS,
+        help="History window to cache in days (default: 10 years)",
+    )
     p.add_argument("--config", default="config.yaml", help="Base config to start from")
     p.add_argument("--cache", default=str(DEFAULT_CACHE_DIR / "bars.pkl"), help="Bar cache path")
     p.add_argument("--out-dir", default=str(DEFAULT_OUT_DIR), help="Output directory")
@@ -106,6 +114,9 @@ def _parse_args() -> argparse.Namespace:
 def _get_or_build_cache(args: argparse.Namespace, cfg: Config) -> BarCache | None:
     cache_path = Path(args.cache)
     cache = None if args.refresh_cache else load_cache(cache_path)
+    if cache is not None and not _cache_is_current(cache, args):
+        logger.info("Cached bars do not satisfy the requested window; rebuilding")
+        cache = None
     if cache is None:
         include_equities = not args.strategy.startswith("crypto")
         include_crypto = args.strategy.startswith("crypto")
@@ -122,6 +133,20 @@ def _get_or_build_cache(args: argparse.Namespace, cfg: Config) -> BarCache | Non
         )
         save_cache(cache, cache_path)
     return cache
+
+
+def _cache_is_current(cache: BarCache, args: argparse.Namespace) -> bool:
+    """Reject old, short, or wrong-asset caches before optimization."""
+    now = datetime.now()
+    requested_start = now - timedelta(days=args.days)
+    if cache.start is None or cache.end is None:
+        return False
+    if cache.start > requested_start or cache.end < now - timedelta(days=1):
+        return False
+    wants_crypto = args.strategy.startswith("crypto")
+    if wants_crypto != bool(cache.crypto_symbols):
+        return False
+    return bool(cache.bars)
 
 
 def _series_for_strategy(cache: BarCache, strategy: str) -> dict[str, list]:
@@ -158,6 +183,51 @@ def _write_report(state: OptimizerState, path: Path) -> None:
                 ]
             )
     logger.info("Wrote optimisation report to %s", path)
+
+
+def _comparison_rows(old: BacktestResult, new: BacktestResult) -> list[tuple[str, str, str, str]]:
+    """Build display rows for an apples-to-apples backtest comparison."""
+    metrics = (
+        ("Ending equity", old.ending_equity, new.ending_equity, "${:,.2f}"),
+        ("Total return", old.total_return_pct, new.total_return_pct, "{:+.2f}%"),
+        ("Closed trades", old.num_trades, new.num_trades, "{}"),
+        ("Win rate", old.win_rate, new.win_rate, "{:.2f}%"),
+        ("Max drawdown", old.max_drawdown_pct, new.max_drawdown_pct, "{:.2f}%"),
+    )
+    return [
+        (name, formatter.format(before), formatter.format(after), formatter.format(after - before))
+        for name, before, after, formatter in metrics
+    ]
+
+
+def _write_comparison(
+    old_cfg: Config,
+    new_cfg: Config,
+    series: dict[str, list],
+    cache: BarCache,
+    strategy: str,
+    path: Path,
+) -> None:
+    """Backtest both configs on the exact cached symbols and window."""
+    old_result = Backtester(old_cfg, strategy=strategy).run_on_series(series)
+    new_result = Backtester(new_cfg, strategy=strategy).run_on_series(series)
+    rows = _comparison_rows(old_result, new_result)
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", newline="", encoding="utf-8") as fh:
+        writer = csv.writer(fh)
+        writer.writerow(["metric", "old", "new", "change"])
+        writer.writerows(rows)
+
+    print("\n=== Before / after backtest ===")
+    print(f"Symbols       : {len(series)}")
+    print(f"Window        : {cache.start} -> {cache.end}")
+    print("Timeframe     : 1day (cached bars)")
+    print(f"{'Metric':<18} {'Old config':>16} {'New config':>16} {'Change':>16}")
+    print("-" * 70)
+    for name, before, after, change in rows:
+        print(f"{name:<18} {before:>16} {after:>16} {change:>16}")
+    print(f"Comparison CSV : {path}")
 
 
 def main() -> None:
@@ -202,6 +272,7 @@ def main() -> None:
         holdout_frac=args.holdout_frac,
         stagnation_patience=args.stagnation_patience,
     )
+    logger.info("Using %d optimizer worker processes", opt.workers)
 
     state_path = out_dir / f"optimize_state_{args.strategy}.json"
     if args.resume:
@@ -229,6 +300,16 @@ def main() -> None:
     best_cfg = opt.best_config()
     optimized_path = out_dir / "config.optimized.yaml"
     dump_config(best_cfg, optimized_path)
+
+    if args.apply:
+        _write_comparison(
+            cfg,
+            best_cfg,
+            series,
+            cache,
+            args.strategy,
+            out_dir / f"backtest_comparison_{args.strategy}.csv",
+        )
 
     logger.info("Best score %.4f with params: %s", state.best_score, state.best_params)
     if opt.interrupted:

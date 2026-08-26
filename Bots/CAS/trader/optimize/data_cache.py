@@ -29,6 +29,7 @@ from trader.data.universe import (
 logger = logging.getLogger(__name__)
 
 DEFAULT_CACHE_DIR = Path("data") / "backtest_cache"
+DEFAULT_CACHE_DAYS = 3650  # approximately 10 years; Alpaca clamps equities to 2016
 CACHE_FORMAT_VERSION = 2
 
 
@@ -145,7 +146,7 @@ def build_cache(
     broker: BrokerClient,
     cfg: Config,
     *,
-    days: int = 1095,
+    days: int = DEFAULT_CACHE_DAYS,
     max_symbols: int | None = None,
     include_equities: bool = True,
     include_crypto: bool = True,
@@ -153,7 +154,7 @@ def build_cache(
 ) -> BarCache:
     """Download daily bars for the selected universe and return a BarCache.
 
-    ``days`` is the trailing history window (default ~3 years). ``max_symbols``
+    ``days`` is the trailing history window (default ~10 years). ``max_symbols``
     caps *each* asset class (equities are volume-ranked before the cap).
     """
     end = datetime.now()

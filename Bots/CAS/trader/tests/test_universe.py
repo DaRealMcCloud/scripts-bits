@@ -119,6 +119,24 @@ def test_all_all_volume_filter():
     assert crypto == ["BTC/USD"]
 
 
+def test_all_all_defaults_to_top_100_by_volume():
+    symbols = [f"COIN{i:03d}/USD" for i in range(101)]
+    bars = {
+        symbol: make_bars(symbol, [100.0] * 30, volume=index + 1)
+        for index, symbol in enumerate(symbols)
+    }
+    broker = FakeBroker(
+        bars=bars,
+        crypto_assets=[_crypto(symbol) for symbol in symbols],
+    )
+    cfg = _cfg(stocks=[], etfs=[], crypto=[CRYPTO_ALL_SENTINEL])
+    universe = build_universe(broker, cfg)
+    crypto = [s for s in universe if "/" in s]
+    assert len(crypto) == 100
+    assert crypto[0] == "COIN100/USD"
+    assert "COIN000/USD" not in crypto
+
+
 def test_no_crypto_capability_adds_nothing_even_with_all_all():
     from trader.brokers.base import BrokerCapabilities, InstrumentIdKind
 
