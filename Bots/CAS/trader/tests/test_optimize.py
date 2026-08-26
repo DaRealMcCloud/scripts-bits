@@ -167,6 +167,16 @@ def test_evaluate_config_is_deterministic():
     assert r1.n_folds_evaluated == r2.n_folds_evaluated
 
 
+def test_symbol_folds_are_stable():
+    from trader.optimize.evaluator import _symbol_folds
+
+    symbols = [f"SYM{i}" for i in range(17)]
+    first = _symbol_folds(symbols, n_folds=4, seed=42)
+    second = _symbol_folds(list(reversed(symbols)), n_folds=4, seed=42)
+
+    assert first == second
+
+
 def test_evaluate_config_reports_validation_separately():
     series = _uptrend_universe()
     cfg = Config()
@@ -175,6 +185,19 @@ def test_evaluate_config_reports_validation_separately():
     res = evaluate_config(req)
     assert res.n_folds_evaluated > 0
     assert isinstance(res.validation_score, float)
+
+
+def test_evaluate_config_reports_holdout_without_changing_selection_score():
+    series = _uptrend_universe(length=180)
+    cfg = Config()
+    request = EvalRequest(cfg=cfg, series=series, strategy="momentum", holdout_frac=0.2)
+    selection = evaluate_config(
+        EvalRequest(cfg=cfg, series=series, strategy="momentum")
+    )
+    result = evaluate_config(request)
+
+    assert result.score == selection.score
+    assert result.holdout_score is not None
 
 
 def test_evaluate_empty_series_is_worst_score():
@@ -238,6 +261,28 @@ def test_optimizer_state_roundtrip(tmp_path):
     assert reloaded is not None
     assert reloaded.strategy == "momentum"
     assert reloaded.completed_rounds == 2
+
+
+def test_optimizer_keeps_partial_state_on_keyboard_interrupt(monkeypatch):
+    series = _uptrend_universe()
+    opt = Optimizer(
+        Config(),
+        series,
+        strategy="momentum",
+        weights=ScoreWeights(min_trades=0),
+        workers=1,
+        restart_every=0,
+    )
+
+    def interrupt(_param_sets):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(opt, "_evaluate_many", interrupt)
+    state = opt.run(rounds=3)
+
+    assert opt.interrupted
+    assert state.completed_rounds == 0
+    assert state.best_params == state.current_params
 
 
 # ── param get/set helpers ─────────────────────────────────────────────────────

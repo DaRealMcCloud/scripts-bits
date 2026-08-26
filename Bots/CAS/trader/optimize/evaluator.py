@@ -20,6 +20,7 @@ The per-symbol return spread *within* each fold is also penalised (see
 from __future__ import annotations
 
 import logging
+import hashlib
 from dataclasses import dataclass, field
 from datetime import datetime
 
@@ -49,6 +50,7 @@ class EvalRequest:
     validation_frac: float = 0.3
     weights: ScoreWeights = field(default_factory=ScoreWeights)
     seed: int = 0
+    holdout_frac: float = 0.0
 
 
 @dataclass
@@ -63,6 +65,7 @@ class EvalResult:
     num_trades: int
     n_folds_evaluated: int
     per_fold_scores: list[float] = field(default_factory=list)
+    holdout_score: float | None = None
 
     def summary(self) -> str:
         return (
@@ -70,6 +73,7 @@ class EvalResult:
             f"val={self.validation_score:+.3f}) ret={self.total_return_pct:+.2f}% "
             f"dd={self.max_drawdown_pct:.1f}% trades={self.num_trades} "
             f"folds={self.n_folds_evaluated}"
+            + (f" holdout={self.holdout_score:+.3f}" if self.holdout_score is not None else "")
         )
 
 
@@ -80,8 +84,11 @@ def _symbol_folds(symbols: list[str], n_folds: int, seed: int) -> list[list[str]
     and reproducible without importing numpy.
     """
     ordered = sorted(symbols)
-    # Stable pseudo-shuffle: sort by a hash salted with the seed.
-    ordered.sort(key=lambda s: hash((seed, s)))
+    # Stable pseudo-shuffle: Python's built-in hash is intentionally randomized
+    # between interpreter processes, so it cannot be used for reproducible folds.
+    ordered.sort(
+        key=lambda s: hashlib.sha256(f"{seed}:{s}".encode("utf-8")).digest()
+    )
     n_folds = max(1, min(n_folds, len(ordered) or 1))
     folds: list[list[str]] = [[] for _ in range(n_folds)]
     for i, s in enumerate(ordered):
@@ -163,6 +170,48 @@ def evaluate_config(req: EvalRequest) -> EvalResult:
     optimizer maximises. ``validation_score`` (out-of-sample) is reported
     separately so the optimizer can prefer params that generalise.
     """
+    if req.holdout_frac > 0:
+        dates = sorted({bar.timestamp for bars in req.series.values() for bar in bars})
+        if len(dates) >= 2:
+            split_at = max(1, min(len(dates) - 1, int(len(dates) * (1 - req.holdout_frac))))
+            selection_end = dates[split_at - 1]
+            selection = {
+                symbol: [bar for bar in bars if bar.timestamp <= selection_end]
+                for symbol, bars in req.series.items()
+            }
+            holdout = {
+                symbol: [bar for bar in bars if bar.timestamp > selection_end]
+                for symbol, bars in req.series.items()
+            }
+            selection_result = evaluate_config(
+                EvalRequest(
+                    cfg=req.cfg,
+                    series=selection,
+                    strategy=req.strategy,
+                    starting_equity=req.starting_equity,
+                    n_symbol_folds=req.n_symbol_folds,
+                    n_time_windows=req.n_time_windows,
+                    validation_frac=req.validation_frac,
+                    weights=req.weights,
+                    seed=req.seed,
+                )
+            )
+            holdout_result = evaluate_config(
+                EvalRequest(
+                    cfg=req.cfg,
+                    series=holdout,
+                    strategy=req.strategy,
+                    starting_equity=req.starting_equity,
+                    n_symbol_folds=req.n_symbol_folds,
+                    n_time_windows=1,
+                    validation_frac=0.0,
+                    weights=req.weights,
+                    seed=req.seed,
+                )
+            )
+            selection_result.holdout_score = holdout_result.score
+            return selection_result
+
     symbols = list(req.series.keys())
     folds = _symbol_folds(symbols, req.n_symbol_folds, req.seed)
     windows = _time_windows(req.series, req.n_time_windows)

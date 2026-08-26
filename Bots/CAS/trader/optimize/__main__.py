@@ -82,12 +82,24 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--resume", action="store_true", help="Resume from saved optimizer state")
     p.add_argument("--apply", action="store_true", help="Write the winner to config.yaml (with backup)")
     p.add_argument("--restart-every", type=int, default=8, help="Random-restart cadence (rounds)")
+    p.add_argument(
+        "--stagnation-patience",
+        type=int,
+        default=100,
+        help="Stop after this many non-improving rounds (0 disables)",
+    )
     p.add_argument("--seed", type=int, default=0, help="Deterministic seed")
     # Composite-objective penalty weights.
     p.add_argument("--w-drawdown", type=float, default=0.5)
     p.add_argument("--w-symbol-var", type=float, default=0.5)
     p.add_argument("--w-fold-var", type=float, default=0.5)
     p.add_argument("--min-trades", type=int, default=20)
+    p.add_argument(
+        "--holdout-frac",
+        type=float,
+        default=0.2,
+        help="Fraction of history reserved for untouched final evaluation (0 disables)",
+    )
     return p.parse_args()
 
 
@@ -114,15 +126,25 @@ def _get_or_build_cache(args: argparse.Namespace, cfg: Config) -> BarCache | Non
 
 def _series_for_strategy(cache: BarCache, strategy: str) -> dict[str, list]:
     if strategy.startswith("crypto"):
-        return cache.subset(cache.crypto_symbols)
-    return cache.subset(cache.stock_symbols)
+        return cache.subset(cache.ordered_symbols(cache.crypto_symbols))
+    return cache.subset(cache.ordered_symbols(cache.stock_symbols))
 
 
 def _write_report(state: OptimizerState, path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", newline="", encoding="utf-8") as fh:
         writer = csv.writer(fh)
-        writer.writerow(["round", "best_score", "accepted", "changed", "eval_summary", "timestamp"])
+        writer.writerow(
+            [
+                "round",
+                "best_score",
+                "accepted",
+                "changed",
+                "eval_summary",
+                "holdout_score",
+                "timestamp",
+            ]
+        )
         for r in state.rounds:
             writer.writerow(
                 [
@@ -131,6 +153,7 @@ def _write_report(state: OptimizerState, path: Path) -> None:
                     r.get("accepted"),
                     ";".join(f"{k}={v}" for k, v in (r.get("changed") or {}).items()),
                     r.get("eval_summary"),
+                    r.get("holdout_score"),
                     r.get("timestamp"),
                 ]
             )
@@ -176,6 +199,8 @@ def main() -> None:
         workers=workers,
         restart_every=args.restart_every,
         seed=args.seed,
+        holdout_frac=args.holdout_frac,
+        stagnation_patience=args.stagnation_patience,
     )
 
     state_path = out_dir / f"optimize_state_{args.strategy}.json"
@@ -190,7 +215,14 @@ def main() -> None:
     def _on_round(state: OptimizerState, _record) -> None:
         save_state(state, state_path)  # save after every round → resumable
 
-    state = opt.run(args.rounds, on_round=_on_round)
+    try:
+        state = opt.run(args.rounds, on_round=_on_round)
+    except KeyboardInterrupt:
+        opt.interrupted = True
+        state = opt.state
+        logger.warning(
+            "Optimisation interrupted; finalising the best result found so far."
+        )
     save_state(state, state_path)
     _write_report(state, out_dir / f"optimize_report_{args.strategy}.csv")
 
@@ -199,7 +231,10 @@ def main() -> None:
     dump_config(best_cfg, optimized_path)
 
     logger.info("Best score %.4f with params: %s", state.best_score, state.best_params)
-    print("\n=== Optimisation complete ===")
+    if opt.interrupted:
+        print("\n=== Optimisation interrupted; partial results finalised ===")
+    else:
+        print("\n=== Optimisation complete ===")
     print(f"Strategy      : {args.strategy}")
     print(f"Rounds run    : {state.completed_rounds}")
     print(f"Best score    : {state.best_score:.4f}")

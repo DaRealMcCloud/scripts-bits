@@ -121,6 +121,7 @@ class RoundRecord:
     accepted: bool
     changed: dict[str, float] = field(default_factory=dict)
     eval_summary: str = ""
+    holdout_score: float | None = None
     timestamp: str = field(default_factory=lambda: datetime.now().isoformat(timespec="seconds"))
 
 
@@ -135,6 +136,7 @@ class OptimizerState:
     # Per-parameter running tally of net improvement contributed by +/- moves.
     # Positive => moving the param UP has tended to help; negative => DOWN helps.
     direction_bias: dict[str, float] = field(default_factory=dict)
+    step_sizes: dict[str, float] = field(default_factory=dict)
     rounds: list[dict] = field(default_factory=list)
     completed_rounds: int = 0
 
@@ -167,6 +169,8 @@ class Optimizer:
         starting_equity: float = 100_000.0,
         restart_every: int = 8,
         seed: int = 0,
+        holdout_frac: float = 0.0,
+        stagnation_patience: int = 0,
     ) -> None:
         if strategy not in DEFAULT_PARAM_SPECS and specs is None:
             raise ValueError(f"No default param specs for strategy '{strategy}'")
@@ -179,13 +183,17 @@ class Optimizer:
         self.restart_every = restart_every
         self.rng = random.Random(seed)
         self.seed = seed
+        self.holdout_frac = max(0.0, min(0.5, holdout_frac))
+        self.stagnation_patience = max(0, stagnation_patience)
         cpu = os.cpu_count() or 1
         self.workers = max(1, workers if workers is not None else cpu)
 
         self.cfg = copy.deepcopy(base_cfg)
         self.state = OptimizerState(strategy=strategy)
+        self.interrupted = False
         self.state.current_params = {s.path: get_param(self.cfg, s.path) for s in self.specs}
         self.state.direction_bias = {s.path: 0.0 for s in self.specs}
+        self.state.step_sizes = {s.path: s.step for s in self.specs}
 
     # ── candidate generation ─────────────────────────────────
     def _apply(self, params: dict[str, float]) -> Config:
@@ -195,6 +203,25 @@ class Optimizer:
             set_param(cfg, path, value, by_path[path].is_int)
         return cfg
 
+    def _is_feasible(self, params: dict[str, float]) -> bool:
+        """Reject parameter combinations that the strategy cannot use safely."""
+        if self.strategy == "momentum":
+            return params["strategies.momentum.fast_lookback"] < params[
+                "strategies.momentum.slow_lookback"
+            ]
+        if self.strategy == "crypto_momentum":
+            return params["strategies.crypto.momentum.fast_ma"] < params[
+                "strategies.crypto.momentum.slow_ma"
+            ]
+        if self.strategy == "crypto_volatility":
+            return params["strategies.crypto.volatility.low_vol_pct"] < params[
+                "strategies.crypto.volatility.high_vol_pct"
+            ]
+        return True
+
+    def _step_for(self, spec: ParamSpec) -> float:
+        return self.state.step_sizes.get(spec.path, spec.step)
+
     def propose(self, current: dict[str, float]) -> list[dict[str, float]]:
         """Return candidate parameter dicts to evaluate this round."""
         candidates: list[dict[str, float]] = []
@@ -202,8 +229,10 @@ class Optimizer:
         for spec in self.specs:
             for direction in (+1, -1):
                 cand = dict(current)
-                cand[spec.path] = _clamp(current[spec.path] + direction * spec.step, spec)
-                if cand[spec.path] != current[spec.path]:
+                cand[spec.path] = _clamp(
+                    current[spec.path] + direction * self._step_for(spec), spec
+                )
+                if cand[spec.path] != current[spec.path] and self._is_feasible(cand):
                     candidates.append(cand)
         # 2. Momentum move: nudge every param toward its historically-helpful
         #    direction (the "adjust more in the improving direction" behaviour).
@@ -212,12 +241,12 @@ class Optimizer:
         for spec in self.specs:
             bias = self.state.direction_bias.get(spec.path, 0.0)
             if bias != 0.0:
-                step = spec.step * (1 if bias > 0 else -1)
+                step = self._step_for(spec) * (1 if bias > 0 else -1)
                 nv = _clamp(current[spec.path] + step, spec)
                 if nv != momentum[spec.path]:
                     momentum[spec.path] = nv
                     moved = True
-        if moved:
+        if moved and self._is_feasible(momentum):
             candidates.append(momentum)
         # De-dupe identical candidates.
         unique: list[dict[str, float]] = []
@@ -229,12 +258,66 @@ class Optimizer:
                 unique.append(c)
         return unique
 
+    def _local_restarts(
+        self, current: dict[str, float], count: int = 4
+    ) -> list[dict[str, float]]:
+        """Generate feasible local perturbations around the incumbent."""
+        candidates: list[dict[str, float]] = []
+        for _ in range(count):
+            candidate = dict(current)
+            for spec in self.specs:
+                radius = 2.0 * self._step_for(spec)
+                candidate[spec.path] = _clamp(
+                    current[spec.path] + self.rng.uniform(-radius, radius), spec
+                )
+            if candidate != current and self._is_feasible(candidate):
+                candidates.append(candidate)
+        logger.info("Local restart: generated %d feasible candidates", len(candidates))
+        return candidates
+
+    def _adapt_steps(
+        self,
+        current: dict[str, float],
+        candidates: list[dict[str, float]],
+        results: list[EvalResult],
+        accepted: bool,
+    ) -> None:
+        """Shrink stagnant dimensions and gently expand useful dimensions."""
+        for spec in self.specs:
+            path = spec.path
+            coordinate_scores = [
+                result.score
+                for candidate, result in zip(candidates, results)
+                if candidate[path] != current[path]
+                and all(
+                    candidate[other.path] == current[other.path]
+                    for other in self.specs
+                    if other.path != path
+                )
+            ]
+            if accepted and any(
+                candidate[path] != current[path]
+                and result.score == max(result.score for result in results)
+                for candidate, result in zip(candidates, results)
+            ):
+                self.state.step_sizes[path] = min(
+                    spec.hi - spec.lo,
+                    self._step_for(spec) * 1.25,
+                )
+            elif not coordinate_scores or max(coordinate_scores) <= self.state.best_score:
+                self.state.step_sizes[path] = max(
+                    spec.step / 16.0,
+                    self._step_for(spec) * 0.5,
+                )
+
     def _random_restart(self) -> dict[str, float]:
-        """Jitter every parameter to a random point within its bounds."""
+        """Return a random feasible point for backwards-compatible callers."""
         params: dict[str, float] = {}
         for spec in self.specs:
             val = self.rng.uniform(spec.lo, spec.hi)
             params[spec.path] = _clamp(val, spec)
+        if not self._is_feasible(params):
+            return dict(self.state.current_params)
         logger.info("Random restart: jittered all parameters")
         return params
 
@@ -249,68 +332,112 @@ class Optimizer:
             seed=self.seed,
         )
 
+    def _evaluate_holdout(self, params: dict[str, float]) -> float | None:
+        if self.holdout_frac <= 0:
+            return None
+        request = EvalRequest(
+            cfg=self._apply(params),
+            series=self.series,
+            strategy=self.strategy,
+            starting_equity=self.starting_equity,
+            weights=self.weights,
+            seed=self.seed,
+            holdout_frac=self.holdout_frac,
+        )
+        return evaluate_config(request).holdout_score
+
     def _evaluate_many(self, param_sets: list[dict[str, float]]) -> list[EvalResult]:
         requests = [self._make_request(p) for p in param_sets]
         if self.workers <= 1 or len(requests) <= 1:
             return [evaluate_config(r) for r in requests]
-        with ProcessPoolExecutor(max_workers=self.workers) as pool:
-            return list(pool.map(_eval_worker, requests))
+        pool = ProcessPoolExecutor(max_workers=self.workers)
+        try:
+            results = list(pool.map(_eval_worker, requests))
+        except KeyboardInterrupt:
+            pool.shutdown(wait=False, cancel_futures=True)
+            raise
+        else:
+            pool.shutdown(wait=True)
+            return results
 
     # ── main loop ─────────────────────────────────────────────
     def run(self, rounds: int, on_round=None) -> OptimizerState:
         """Run ``rounds`` optimisation rounds and return the final state."""
-        # Establish the baseline score for the starting parameters.
-        if self.state.best_score == float("-inf"):
-            base = evaluate_config(self._make_request(self.state.current_params))
-            self.state.best_score = base.score
-            self.state.best_params = dict(self.state.current_params)
-            logger.info("Baseline %s", base.summary())
+        self.interrupted = False
+        stagnant_rounds = 0
+        try:
+            # Establish the baseline score for the starting parameters.
+            if self.state.best_score == float("-inf"):
+                base = evaluate_config(self._make_request(self.state.current_params))
+                self.state.best_score = base.score
+                self.state.best_params = dict(self.state.current_params)
+                logger.info("Baseline %s", base.summary())
 
-        for r in range(rounds):
-            round_no = self.state.completed_rounds + 1
-            current = dict(self.state.current_params)
+            for r in range(rounds):
+                round_no = self.state.completed_rounds + 1
+                current = dict(self.state.current_params)
 
-            if self.restart_every and round_no % self.restart_every == 0:
-                candidates = [self._random_restart()]
-            else:
-                candidates = self.propose(current)
-            if not candidates:
-                break
+                if self.restart_every and round_no % self.restart_every == 0:
+                    candidates = self._local_restarts(current)
+                else:
+                    candidates = self.propose(current)
+                if not candidates:
+                    break
 
-            results = self._evaluate_many(candidates)
-            best_idx = max(range(len(results)), key=lambda i: results[i].score)
-            best_cand = candidates[best_idx]
-            best_res = results[best_idx]
+                results = self._evaluate_many(candidates)
+                best_idx = max(range(len(results)), key=lambda i: results[i].score)
+                best_cand = candidates[best_idx]
+                best_res = results[best_idx]
 
-            accepted = best_res.score > self.state.best_score
-            changed: dict[str, float] = {}
-            if accepted:
-                # Update direction bias for every param that moved.
-                for spec in self.specs:
-                    delta = best_cand[spec.path] - current[spec.path]
-                    if delta != 0:
-                        gain = best_res.score - self.state.best_score
-                        sign = 1.0 if delta > 0 else -1.0
-                        self.state.direction_bias[spec.path] += sign * gain
-                        changed[spec.path] = best_cand[spec.path]
-                self.state.current_params = dict(best_cand)
-                self.state.best_params = dict(best_cand)
-                self.state.best_score = best_res.score
-                logger.info("Round %d ACCEPTED %s | changed=%s", round_no, best_res.summary(), changed)
-            else:
-                logger.info("Round %d no improvement (best cand %s)", round_no, best_res.summary())
+                accepted = best_res.score > self.state.best_score
+                changed: dict[str, float] = {}
+                if accepted:
+                    # Update direction bias for every param that moved.
+                    for spec in self.specs:
+                        delta = best_cand[spec.path] - current[spec.path]
+                        if delta != 0:
+                            gain = best_res.score - self.state.best_score
+                            sign = 1.0 if delta > 0 else -1.0
+                            self.state.direction_bias[spec.path] += sign * gain
+                            changed[spec.path] = best_cand[spec.path]
+                    self.state.current_params = dict(best_cand)
+                    self.state.best_params = dict(best_cand)
+                    self.state.best_score = best_res.score
+                    logger.info("Round %d ACCEPTED %s | changed=%s", round_no, best_res.summary(), changed)
+                else:
+                    logger.info("Round %d no improvement (best cand %s)", round_no, best_res.summary())
 
-            record = RoundRecord(
-                round=round_no,
-                best_score=self.state.best_score,
-                accepted=accepted,
-                changed=changed,
-                eval_summary=best_res.summary(),
+                self._adapt_steps(current, candidates, results, accepted)
+                holdout_score = (
+                    self._evaluate_holdout(self.state.best_params) if accepted else None
+                )
+
+                record = RoundRecord(
+                    round=round_no,
+                    best_score=self.state.best_score,
+                    accepted=accepted,
+                    changed=changed,
+                    eval_summary=best_res.summary(),
+                    holdout_score=holdout_score,
+                )
+                self.state.rounds.append(asdict(record))
+                self.state.completed_rounds = round_no
+                if on_round is not None:
+                    on_round(self.state, record)
+                stagnant_rounds = 0 if accepted else stagnant_rounds + 1
+                if self.stagnation_patience and stagnant_rounds >= self.stagnation_patience:
+                    logger.info(
+                        "Stopping after %d stagnant rounds at round %d",
+                        stagnant_rounds,
+                        round_no,
+                    )
+                    break
+        except KeyboardInterrupt:
+            self.interrupted = True
+            logger.warning(
+                "Optimisation interrupted after %d completed rounds; keeping the best result found so far.",
+                self.state.completed_rounds,
             )
-            self.state.rounds.append(asdict(record))
-            self.state.completed_rounds = round_no
-            if on_round is not None:
-                on_round(self.state, record)
 
         return self.state
 

@@ -29,7 +29,7 @@ from trader.data.universe import (
 logger = logging.getLogger(__name__)
 
 DEFAULT_CACHE_DIR = Path("data") / "backtest_cache"
-CACHE_FORMAT_VERSION = 1
+CACHE_FORMAT_VERSION = 2
 
 
 @dataclass
@@ -37,6 +37,8 @@ class BarCache:
     """A pickled bundle of historical bars plus the metadata to trust it."""
 
     bars: dict[str, list[Bar]] = field(default_factory=dict)
+    requested_symbols: list[str] = field(default_factory=list)
+    asset_classes: dict[str, str] = field(default_factory=dict)
     start: datetime | None = None
     end: datetime | None = None
     created_at: datetime = field(default_factory=datetime.now)
@@ -48,21 +50,47 @@ class BarCache:
         return list(self.bars.keys())
 
     @property
+    def missing_symbols(self) -> list[str]:
+        """Symbols requested from the broker for which no bars were returned."""
+        requested = getattr(self, "requested_symbols", [])
+        return [s for s in requested if s not in self.bars]
+
+    def ordered_symbols(self, symbols: list[str] | None = None) -> list[str]:
+        """Return symbols in deterministic asset/coverage/name order."""
+        selected = symbols if symbols is not None else self.symbols
+
+        def sort_key(symbol: str) -> tuple:
+            bars = self.bars.get(symbol, [])
+            asset_classes = getattr(self, "asset_classes", {})
+            asset_class = asset_classes.get(
+                symbol, "crypto" if "/" in symbol else "equity"
+            )
+            return (
+                0 if asset_class == "equity" else 1,
+                0 if bars else 1,
+                -len(bars),
+                symbol,
+            )
+
+        return sorted(selected, key=sort_key)
+
+    @property
     def stock_symbols(self) -> list[str]:
-        return [s for s in self.bars if "/" not in s]
+        return [s for s in self.ordered_symbols() if "/" not in s]
 
     @property
     def crypto_symbols(self) -> list[str]:
-        return [s for s in self.bars if "/" in s]
+        return [s for s in self.ordered_symbols() if "/" in s]
 
     def subset(self, symbols: list[str]) -> dict[str, list[Bar]]:
         """Return the cached series for the given symbols (present ones only)."""
-        return {s: self.bars[s] for s in symbols if s in self.bars}
+        return {s: self.bars[s] for s in self.ordered_symbols(symbols) if s in self.bars}
 
     def summary(self) -> str:
         return (
             f"BarCache: {len(self.bars)} symbols "
             f"({len(self.stock_symbols)} equity / {len(self.crypto_symbols)} crypto), "
+            f"missing {len(self.missing_symbols)}, "
             f"window {self.start} → {self.end}, built {self.created_at:%Y-%m-%d %H:%M}"
         )
 
@@ -138,7 +166,7 @@ def build_cache(
         include_crypto=include_crypto,
         include_equities=include_equities,
     )
-    all_symbols = equities + crypto
+    all_symbols = sorted(equities) + sorted(crypto)
     logger.info(
         "Building bar cache: %d symbols (%d equity, %d crypto), %d-day window",
         len(all_symbols),
@@ -160,7 +188,20 @@ def build_cache(
                 bars[sym] = sorted(sym_bars, key=lambda b: b.timestamp)
         logger.info("Fetched %d/%d symbols", min(i + chunk_size, len(all_symbols)), len(all_symbols))
 
-    cache = BarCache(bars=bars, start=start, end=end)
+    cache = BarCache(
+        bars=bars,
+        requested_symbols=all_symbols,
+        asset_classes={s: "crypto" for s in crypto}
+        | {s: "equity" for s in equities},
+        start=start,
+        end=end,
+    )
+    if cache.missing_symbols:
+        logger.warning(
+            "No bars returned for %d/%d requested symbols",
+            len(cache.missing_symbols),
+            len(cache.requested_symbols),
+        )
     logger.info("%s", cache.summary())
     return cache
 
