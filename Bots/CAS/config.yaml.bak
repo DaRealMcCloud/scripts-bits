@@ -130,9 +130,9 @@ strategies:
     momentum:
       enabled: true
       weight: 1.0
-      fast_ma: 21
-      slow_ma: 29
-      adx_min: 20.15625
+      fast_ma: 24
+      slow_ma: 28
+      adx_min: 23.154296875
       top_n: 10
     mean_reversion:
       enabled: false
