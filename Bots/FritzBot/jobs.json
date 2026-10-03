@@ -1,0 +1,9 @@
+[
+  {
+    "address": "10.0.0.1",
+    "port": 49000,
+    "user": "dslf-config",
+    "service": "DeviceInfo",
+    "action": "GetInfo"
+  }
+]
